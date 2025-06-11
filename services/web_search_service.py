@@ -20,20 +20,24 @@ class WebSearchService:
         self.serper_api_key = os.getenv('SERPER_API_KEY')
         self.perplexity_api_key = os.getenv('PERPLEXITY_API_KEY')
         self.trusted_sources = {
-            'reuters.com': 'News',
-            'bloomberg.com': 'News',
-            'wsj.com': 'News',
-            'ft.com': 'News',
             'bbc.com': 'News',
-            'cnn.com': 'News',
-            'nytimes.com': 'News',
-            'washingtonpost.com': 'News',
             'theguardian.com': 'News',
             'apnews.com': 'News',
             'opensanctions.org': 'Sanctions',
             'treasury.gov': 'Government',
-            'fincen.gov': 'Government'
+            'fincen.gov': 'Government',
+            'aljazeera.com': 'News',
+            'forbes.com': 'News',
+            'npr.org': 'News',
+            'dw.com': 'News',
+            'abcnews.go.com': 'News',
+            'voanews.com': 'News',      
+            'indiatoday.in': 'News',
+            'hindustantimes.com': 'News',
+            'livemint.com': 'News',
+            'france24.com': 'News'
         }
+
         logger.info("Web search service initialized for real-time search")
     
     def set_fast_mode(self, enabled: bool):
