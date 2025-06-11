@@ -8,28 +8,47 @@ from services.opensanctions_service import OpenSanctionsService
 from services.web_search_service import WebSearchService
 from services.ai_service import AIService
 from graph.neo4j_service import Neo4jService
-from utils.risk_calculator import RiskCalculator
-from utils.errors import RisknetError
 from utils.cache import CacheManager
+from datetime import datetime
+import os
 
 logger = logging.getLogger(__name__)
 
+class RisknetError(Exception):
+    """Custom exception for Risknet service errors."""
+    pass
+
 class RiskService:
-    """Main service orchestrating real risk assessment with flexible input handling"""
+    """Service for risk assessment"""
     
-    def __init__(self, cache_manager):
-        """Initialize risk service with required components"""
-        self.cache_manager = cache_manager
-        self.enable_fast_mode = False
-        
-        # Initialize services
+    def __init__(self):
+        """Initialize risk service"""
         self.opensanctions_service = OpenSanctionsService()
         self.web_search_service = WebSearchService()
         self.ai_service = AIService()
-        self.neo4j_service = Neo4jService()
-        self.risk_calculator = RiskCalculator()
         
-        logger.info("Risk service initialized with all components")
+        # Initialize Neo4j service with error handling
+        try:
+            self.neo4j_service = Neo4jService()
+            self.neo4j_available = True
+        except Exception as e:
+            logger.warning(f"Neo4j service initialization failed: {str(e)}")
+            self.neo4j_available = False
+            self.neo4j_service = None
+        
+        self.cache_manager = CacheManager()
+        self.fast_mode = False
+        
+        # Initialize available APIs
+        self.available_apis = {
+            'serper': bool(os.getenv('SERPER_API_KEY')),
+            'openai': bool(os.getenv('OPENAI_API_KEY')),
+            'deepseek': bool(os.getenv('DEEPSEEK_API_KEY')),
+            'perplexity': bool(os.getenv('PERPLEXITY_API_KEY')),
+            'neo4j': self.neo4j_available
+        }
+        
+        logger.info(f"Risk service initialized with available APIs: {self.available_apis}")
     
     def assess_risk(self, validated_data: Dict[str, Any]) -> Dict[str, Any]:
         """Comprehensive risk assessment with flexible person/company input handling"""
@@ -52,7 +71,7 @@ class RiskService:
             search_entities = self._prepare_search_entities(validated_data)
             
             # OPTIMIZATION: Use parallel processing for multiple entities
-            if len(search_entities) > 1 and self.enable_fast_mode:
+            if len(search_entities) > 1 and self.fast_mode:
                 logger.info("Using parallel processing for multiple entities")
                 return self._assess_risk_parallel(validated_data, search_entities, start_time)
             else:
@@ -93,7 +112,7 @@ class RiskService:
                     sanctions_results[entity_key] = future.result(timeout=10)
                 except Exception as e:
                     logger.error(f"Sanctions check failed for {entity_key}: {e}")
-                    sanctions_results[entity_key] = {'matches': [], 'total_matches': 0, 'matched': False}
+                    sanctions_results[entity_key] = {'matches': [], 'total_matches': 0, 'matched': False, 'risk_score': 0}
             
             # Wait for web intelligence results
             for entity_key, future in web_futures.items():
@@ -101,7 +120,7 @@ class RiskService:
                     web_intelligence_results[entity_key] = future.result(timeout=30)
                 except Exception as e:
                     logger.error(f"Web intelligence failed for {entity_key}: {e}")
-                    web_intelligence_results[entity_key] = {'results': [], 'total_results': 0}
+                    web_intelligence_results[entity_key] = {'results': [], 'total_results': 0, 'risk_score': 0}
             
             # Step 3: AI analysis
             logger.info("Performing AI analysis...")
@@ -114,28 +133,29 @@ class RiskService:
             # Step 4: Graph analysis and entity relationship handling
             logger.info("Analyzing entity connections...")
             entity_ids = []
-            graph_analysis = {}
+            relationship_analysis = {'created_relationships': [], 'director_relationships': [], 'entity_relationships': []}
             
-            # Create or update entities in Neo4j
-            for entity_key, entity_data in search_entities.items():
-                sanctions_data = sanctions_results.get(entity_key, {})
-                web_data = web_intelligence_results.get(entity_key, {})
-                entity_id = self.neo4j_service.create_or_update_entity(entity_data, sanctions_data, web_data)
-                entity_ids.append(entity_id)
-                graph_analysis[entity_id] = self.neo4j_service.analyze_entity_connections(entity_id)
-            
-            # Handle entity relationships
-            relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
+            if self.neo4j_available:
+                # Create or update entities in Neo4j
+                for entity_key, entity_data in search_entities.items():
+                    try:
+                        sanctions_data = sanctions_results.get(entity_key, {})
+                        web_data = web_intelligence_results.get(entity_key, {})
+                        entity_id = self.neo4j_service.create_or_update_entity(entity_data, sanctions_data, web_data)
+                        entity_ids.append(entity_id)
+                    except Exception as e:
+                        logger.error(f"Failed to create entity in Neo4j: {e}")
+                
+                # Handle entity relationships
+                relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
             
             # Step 5: Calculate overall risk
             logger.info("Calculating final risk score...")
-            risk_calculation = self.risk_calculator.calculate_comprehensive_risk(
-                sanctions_results, web_intelligence_results, graph_analysis, input_type
-            )
+            risk_calculation = self._calculate_risk_score(sanctions_results, web_intelligence_results, ai_summary, relationship_analysis)
             
             # Build final response
             return self._build_final_response(validated_data, sanctions_results, web_intelligence_results, 
-                                            ai_summary, graph_analysis, risk_calculation, entity_ids, start_time, relationship_analysis)
+                                            ai_summary, {}, risk_calculation, entity_ids, start_time, relationship_analysis)
     
     def _assess_risk_sequential(self, validated_data: Dict[str, Any], search_entities: Dict[str, Dict[str, Any]], start_time: float) -> Dict[str, Any]:
         """Sequential processing for single entity or when parallel processing is disabled"""
@@ -145,13 +165,21 @@ class RiskService:
         logger.info("Checking OpenSanctions database...")
         sanctions_results = {}
         for entity_key, entity_data in search_entities.items():
-            sanctions_results[entity_key] = self.opensanctions_service.check_entity(entity_data)
+            try:
+                sanctions_results[entity_key] = self.opensanctions_service.check_entity(entity_data)
+            except Exception as e:
+                logger.error(f"Sanctions check failed for {entity_key}: {e}")
+                sanctions_results[entity_key] = {'matches': [], 'total_matches': 0, 'matched': False, 'risk_score': 0}
         
         # Step 2: Web intelligence gathering
         logger.info("Gathering web intelligence...")
         web_intelligence_results = {}
         for entity_key, entity_data in search_entities.items():
-            web_intelligence_results[entity_key] = self.web_search_service.search_entity(entity_data)
+            try:
+                web_intelligence_results[entity_key] = self.web_search_service.search_entity(entity_data)
+            except Exception as e:
+                logger.error(f"Web intelligence failed for {entity_key}: {e}")
+                web_intelligence_results[entity_key] = {'results': [], 'total_results': 0, 'risk_score': 0}
         
         # Step 3: AI-powered analysis
         logger.info("Performing AI analysis...")
@@ -159,41 +187,236 @@ class RiskService:
         for results in web_intelligence_results.values():
             all_web_results.extend(results.get('results', []))
         
-        ai_summary = self.ai_service.summarize_search_results(all_web_results, search_entities)
+        try:
+            ai_summary = self.ai_service.summarize_search_results(all_web_results, search_entities)
+        except Exception as e:
+            logger.error(f"AI analysis failed: {e}")
+            ai_summary = {'summary': 'AI analysis failed', 'risk_score': 0, 'confidence': 0}
         
         # Step 4: Graph analysis and entity relationship handling
         logger.info("Analyzing entity connections...")
         entity_ids = []
-        graph_analysis = {}
+        relationship_analysis = {'created_relationships': [], 'director_relationships': [], 'entity_relationships': []}
         
-        # Create or update entities in Neo4j
-        for entity_key, entity_data in search_entities.items():
-            sanctions_data = sanctions_results.get(entity_key, {})
-            web_data = web_intelligence_results.get(entity_key, {})
-            entity_id = self.neo4j_service.create_or_update_entity(entity_data, sanctions_data, web_data)
-            entity_ids.append(entity_id)
-            graph_analysis[entity_id] = self.neo4j_service.analyze_entity_connections(entity_id)
-        
-        # Handle entity relationships
-        relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
+        if self.neo4j_available:
+            # Create or update entities in Neo4j
+            for entity_key, entity_data in search_entities.items():
+                try:
+                    sanctions_data = sanctions_results.get(entity_key, {})
+                    web_data = web_intelligence_results.get(entity_key, {})
+                    entity_id = self.neo4j_service.create_or_update_entity(entity_data, sanctions_data, web_data)
+                    entity_ids.append(entity_id)
+                except Exception as e:
+                    logger.error(f"Failed to create entity in Neo4j: {e}")
+            
+            # Handle entity relationships
+            relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
         
         # Step 5: Calculate overall risk
         logger.info("Calculating final risk score...")
-        risk_calculation = self.risk_calculator.calculate_comprehensive_risk(
-            sanctions_results, web_intelligence_results, graph_analysis, input_type
-        )
+        risk_calculation = self._calculate_risk_score(sanctions_results, web_intelligence_results, ai_summary, relationship_analysis)
         
         # Build final response
         return self._build_final_response(validated_data, sanctions_results, web_intelligence_results, 
-                                        ai_summary, graph_analysis, risk_calculation, entity_ids, start_time, relationship_analysis)
+                                        ai_summary, {}, risk_calculation, entity_ids, start_time, relationship_analysis)
     
+    def _calculate_risk_score(self, sanctions_results, web_results, ai_results, relationship_results):
+        """Calculate the final risk score based on all available data sources."""
+        try:
+            logger.debug(f"Calculating risk score with: sanctions={type(sanctions_results)}, web={type(web_results)}, ai={type(ai_results)}, relationships={type(relationship_results)}")
+            
+            # Helper function to safely aggregate scores from dict of dicts
+            def aggregate_scores(results, score_key='risk_score', default=0):
+                if isinstance(results, dict):
+                    total = 0
+                    count = 0
+                    for key, value in results.items():
+                        if isinstance(value, dict):
+                            score = value.get(score_key, default)
+                            if isinstance(score, (int, float)):
+                                total += score
+                                count += 1
+                        elif isinstance(value, (int, float)):
+                            total += value
+                            count += 1
+                    return total / count if count > 0 else default
+                elif isinstance(results, (int, float)):
+                    return results
+                else:
+                    return default
+
+            # Calculate component scores with enhanced logic for high-confidence matches
+            sanctions_score = 0
+            if isinstance(sanctions_results, dict):
+                for entity_key, result in sanctions_results.items():
+                    if isinstance(result, dict):
+                        base_score = result.get('risk_score', 0)
+                        highest_confidence = result.get('highest_confidence', 0)
+                        matched = result.get('matched', False)
+                        
+                        # Use the OpenSanctions calculated score directly if it's higher
+                        # Only apply minimum scoring if OpenSanctions score is too low
+                        if matched and highest_confidence >= 95 and base_score < 80:
+                            base_score = max(base_score, 80)  # Minimum for perfect matches
+                        elif matched and highest_confidence >= 85 and base_score < 70:
+                            base_score = max(base_score, 70)
+                        
+                        # Always use the higher of calculated vs minimum
+                        sanctions_score = max(sanctions_score, base_score)
+            
+            web_score = aggregate_scores(web_results, 'risk_score', 0)
+            ai_score = aggregate_scores(ai_results, 'risk_score', 0) if isinstance(ai_results, dict) else 0
+            relationship_score = len(relationship_results.get('created_relationships', [])) * 5 if isinstance(relationship_results, dict) else 0
+            
+            # Enhanced weights for high-risk scenarios
+            if sanctions_score >= 80:
+                weights = {
+                    'sanctions': 0.8,  # Much higher weight for high sanctions scores
+                    'web_intelligence': 0.15,
+                    'ai_analysis': 0.03,
+                    'relationships': 0.02
+                }
+            elif sanctions_score >= 60:
+                weights = {
+                    'sanctions': 0.7,  # Higher weight for medium-high sanctions
+                    'web_intelligence': 0.2,
+                    'ai_analysis': 0.07,
+                    'relationships': 0.03
+                }
+            else:
+                weights = {
+                    'sanctions': 0.4,
+                    'web_intelligence': 0.3,
+                    'ai_analysis': 0.2,
+                    'relationships': 0.1
+                }
+            
+            # Normalize weights
+            total_weight = sum(weights.values())
+            weights = {k: v/total_weight for k, v in weights.items()}
+            
+            # Calculate weighted score
+            final_score = (
+                sanctions_score * weights['sanctions'] +
+                web_score * weights['web_intelligence'] +
+                ai_score * weights['ai_analysis'] +
+                relationship_score * weights['relationships']
+            )
+            
+            # Ensure score is within 0-100 range
+            risk_score = min(max(round(final_score), 0), 100)
+            risk_level = self._get_risk_level(risk_score)
+            
+            # Collect risk factors
+            risk_factors = self._collect_risk_factors(sanctions_results, web_results, ai_results, relationship_results)
+            
+            logger.debug(f"Calculated risk score: {risk_score}, level: {risk_level}")
+            
+            return {
+                'risk_score': risk_score,
+                'risk_level': risk_level,
+                'risk_factors': risk_factors,
+                'component_scores': {
+                    'sanctions': sanctions_score,
+                    'web_intelligence': web_score,
+                    'ai_analysis': ai_score,
+                    'relationships': relationship_score
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating risk score: {str(e)}")
+            return {
+                'risk_score': 0,
+                'risk_level': 'unknown',
+                'risk_factors': [],
+                'component_scores': {
+                    'sanctions': 0,
+                    'web_intelligence': 0,
+                    'ai_analysis': 0,
+                    'relationships': 0
+                },
+                'error': str(e)
+            }
+
+    def _collect_risk_factors(self, sanctions_results, web_results, ai_results, relationship_results):
+        """Collect risk factors from all sources."""
+        risk_factors = []
+        
+        try:
+            # Sanctions risk factors
+            if isinstance(sanctions_results, dict):
+                for entity_key, result in sanctions_results.items():
+                    if isinstance(result, dict):
+                        for match in result.get('matches', []):
+                            risk_factors.append({
+                                'source': 'sanctions',
+                                'type': 'sanctions_match',
+                                'description': f"Sanctions match: {match.get('name', 'Unknown')}",
+                                'confidence': match.get('confidence', 0.0),
+                                'severity': 'high'
+                            })
+            
+            # Web search risk factors
+            if isinstance(web_results, dict):
+                for entity_key, result in web_results.items():
+                    if isinstance(result, dict):
+                        for indicator in result.get('risk_indicators', []):
+                            risk_factors.append({
+                                'source': 'web_search',
+                                'type': 'web_indicator',
+                                'description': indicator,
+                                'confidence': 0.7,
+                                'severity': 'medium'
+                            })
+            
+            # AI analysis risk factors
+            if isinstance(ai_results, dict):
+                for finding in ai_results.get('key_findings', []):
+                    risk_factors.append({
+                        'source': 'ai_analysis',
+                        'type': 'ai_finding',
+                        'description': finding,
+                        'confidence': ai_results.get('confidence', 0.5),
+                        'severity': 'medium'
+                    })
+            
+            # Relationship risk factors
+            if isinstance(relationship_results, dict):
+                created_relationships = relationship_results.get('created_relationships', [])
+                if len(created_relationships) > 2:
+                    risk_factors.append({
+                        'source': 'relationships',
+                        'type': 'complex_relationships',
+                        'description': f"Multiple entity relationships detected ({len(created_relationships)})",
+                        'confidence': 0.8,
+                        'severity': 'medium'
+                    })
+        
+        except Exception as e:
+            logger.error(f"Error collecting risk factors: {str(e)}")
+            risk_factors.append({
+                'source': 'system',
+                'type': 'processing_error',
+                'description': f"Error processing risk factors: {str(e)}",
+                'confidence': 1.0,
+                'severity': 'low'
+            })
+        
+        return risk_factors
+
     def _handle_entity_relationships(self, validated_data: Dict[str, Any], entity_ids: List[str]) -> Dict[str, Any]:
         """Handle entity relationships and director associations"""
         relationship_analysis = {
             'relationships_created': [],
             'director_relationships': [],
-            'entity_associations': {}
+            'entity_associations': {},
+            'neo4j_available': self.neo4j_available
         }
+        
+        if not self.neo4j_available:
+            logger.warning("Neo4j service not available - skipping relationship analysis")
+            return relationship_analysis
         
         try:
             # Handle person-company relationships
@@ -280,7 +503,7 @@ class RiskService:
                             web_intelligence_results: Dict[str, Any], ai_summary: Dict[str, Any], 
                             graph_analysis: Dict[str, Any], risk_calculation: Dict[str, Any], 
                             entity_ids: List[str], start_time: float, relationship_analysis: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Build the final comprehensive response"""
+        """Build the final comprehensive response with integrated relationship analysis"""
         input_type = validated_data.get('input_type', 'unknown')
         processing_time = int((time.time() - start_time) * 1000)
         
@@ -291,7 +514,7 @@ class RiskService:
             'risk_level': risk_calculation['risk_level'],
             'assessment_timestamp': int(time.time()),
             'processing_time_ms': processing_time,
-            'performance_mode': 'parallel' if len(validated_data.get('person', {}).get('name', '') + validated_data.get('company', {}).get('name', '')) > 1 and self.enable_fast_mode else 'sequential',
+            'performance_mode': 'parallel' if len(validated_data.get('person', {}).get('name', '') + validated_data.get('company', {}).get('name', '')) > 1 and self.fast_mode else 'sequential',
             'sanctions_check': self._build_sanctions_response(sanctions_results),
             'web_intelligence': self._build_web_intelligence_response(web_intelligence_results),
             'ai_summary': {
@@ -311,12 +534,19 @@ class RiskService:
             },
             'risk_factors': risk_calculation['risk_factors'],
             'recommendations': self._generate_recommendations(risk_calculation, input_type),
-            'cache_key': self._generate_cache_key(validated_data)
+            'cache_key': self._generate_cache_key(validated_data),
+            'api_availability': self.available_apis
         }
         
-        # Add relationship analysis if available
+        # Enhanced relationship analysis - now includes comprehensive details
         if relationship_analysis:
             comprehensive_result['entity_relationships'] = relationship_analysis
+            
+            # Add detailed entity graph data for each entity
+            comprehensive_result['detailed_graph_data'] = self._get_comprehensive_graph_data(entity_ids)
+            
+            # Add comprehensive relationship details for each entity
+            comprehensive_result['comprehensive_relationships'] = self._get_comprehensive_relationships(entity_ids)
             
             # Add director suggestions if company has director data
             if validated_data.get('company') and relationship_analysis.get('director_relationships'):
@@ -331,6 +561,66 @@ class RiskService:
         entity_name = self._get_primary_entity_name(validated_data)
         logger.info(f"Risk assessment completed in {processing_time}ms for {input_type}: {entity_name}")
         return comprehensive_result
+
+    def _get_comprehensive_graph_data(self, entity_ids: List[str]) -> Dict[str, Any]:
+        """Get comprehensive graph data for entities"""
+        if not self.neo4j_available:
+            return {
+                'total_entities': 0,
+                'entities': {},
+                'neo4j_available': False,
+                'status': 'Neo4j service temporarily unavailable - analysis limited to other data sources'
+            }
+        
+        # Implementation when Neo4j is available
+        try:
+            # Get detailed entity data from Neo4j
+            return self.neo4j_service.get_comprehensive_graph_data(entity_ids)
+        except Exception as e:
+            logger.error(f"Failed to get comprehensive graph data: {e}")
+            return {
+                'total_entities': 0,
+                'entities': {},
+                'neo4j_available': False,
+                'status': 'Graph analysis temporarily unavailable'
+            }
+
+    def _get_comprehensive_relationships(self, entity_ids: List[str]) -> Dict[str, Any]:
+        """Get comprehensive relationship data"""
+        if not self.neo4j_available:
+            return {
+                'total_entities': 0,
+                'connected_entities': 0,
+                'relationship_types': [],
+                'total_relationships': 0,
+                'entities': {},
+                'neo4j_available': False,
+                'summary': {
+                    'total_relationships': 0,
+                    'connected_entities': 0,
+                    'relationship_types': []
+                },
+                'status': 'Relationship analysis temporarily unavailable - analysis based on other data sources'
+            }
+        
+        try:
+            return self.neo4j_service.get_comprehensive_relationships(entity_ids)
+        except Exception as e:
+            logger.error(f"Failed to get comprehensive relationships: {e}")
+            return {
+                'total_entities': 0,
+                'connected_entities': 0,
+                'relationship_types': [],
+                'total_relationships': 0,
+                'entities': {},
+                'neo4j_available': False,
+                'summary': {
+                    'total_relationships': 0,
+                    'connected_entities': 0,
+                    'relationship_types': []
+                },
+                'status': 'Relationship analysis temporarily unavailable'
+            }
 
     def _generate_director_analysis(self, company_data: Dict[str, Any], director_relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate analysis and suggestions based on director information"""
@@ -380,11 +670,6 @@ class RiskService:
         
         return analysis
 
-    def set_fast_mode(self, enabled: bool):
-        """Enable or disable fast mode optimizations"""
-        self.enable_fast_mode = enabled
-        logger.info(f"Fast mode {'enabled' if enabled else 'disabled'}")
-
     def _prepare_search_entities(self, validated_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """Prepare entities for search based on input type"""
         search_entities = {}
@@ -432,12 +717,14 @@ class RiskService:
         total_matches = 0
         highest_confidence = 0
         matched = False
+        max_risk_score = 0
         
         for entity_key, result in sanctions_results.items():
             matches = result.get('matches', [])
             all_matches.extend([{**match, 'entity_type': entity_key} for match in matches])
             total_matches += result.get('total_matches', 0)
             highest_confidence = max(highest_confidence, result.get('highest_confidence', 0))
+            max_risk_score = max(max_risk_score, result.get('risk_score', 0))
             if result.get('matched', False):
                 matched = True
         
@@ -446,6 +733,7 @@ class RiskService:
             'total_matches': total_matches,
             'highest_confidence': highest_confidence,
             'matched': matched,
+            'risk_score': max_risk_score,  # Include the OpenSanctions calculated risk score
             'status': 'checked',
             'entities_checked': list(sanctions_results.keys())
         }
@@ -476,34 +764,23 @@ class RiskService:
             'total_results': total_results,
             'risk_indicators': list(set(all_risk_indicators)),
             'sentiment_score': avg_sentiment,
-            'sources_searched': list(all_sources),
+            'sources_searched': list(all_sources),  # Convert set to list for JSON serialization
             'queries_used': all_queries,
             'status': 'completed',
             'entities_searched': list(web_intelligence_results.keys())
         }
     
-    def get_entity_graph(self, entity_id: str) -> Dict[str, Any]:
-        """Get graph data for an entity"""
-        try:
-            graph_data = self.neo4j_service.get_entity_graph_data(entity_id)
-            return {
-                'entity_id': entity_id,
-                'nodes': graph_data.get('nodes', []),
-                'relationships': graph_data.get('relationships', [])
-            }
-        except Exception as e:
-            logger.error(f"Failed to get graph data: {str(e)}")
-            return {
-                'entity_id': entity_id,
-                'nodes': [],
-                'relationships': [],
-                'error': str(e)
-            }
-    
     def get_statistics(self) -> Dict[str, Any]:
         """Get comprehensive API usage statistics"""
         try:
-            db_stats = self.neo4j_service.get_database_stats()
+            db_stats = {}
+            if self.neo4j_available:
+                try:
+                    db_stats = self.neo4j_service.get_database_stats()
+                except Exception as e:
+                    logger.error(f"Failed to get Neo4j stats: {str(e)}")
+                    db_stats = {'error': str(e)}
+            
             return {
                 'total_requests': 42,  # This would come from a real counter
                 'average_response_time': 1250,
@@ -516,7 +793,8 @@ class RiskService:
                 'data_sources': {
                     'opensanctions_status': 'loaded' if self.opensanctions_service.data_loaded else 'failed',
                     'web_search_available': bool(self.web_search_service.serper_api_key or self.web_search_service.perplexity_api_key),
-                    'ai_services_available': bool(self.ai_service.openai_api_key or self.ai_service.deepseek_api_key)
+                    'ai_services_available': bool(self.ai_service.openai_api_key or self.ai_service.deepseek_api_key),
+                    'neo4j_available': self.neo4j_available
                 }
             }
         except Exception as e:
@@ -526,31 +804,15 @@ class RiskService:
                 'message': str(e)
             }
 
-    def _generate_cache_key(self, validated_data: Dict[str, Any]) -> str:
-        """Generate a unique cache key for validated data"""
-        # Create a consistent string representation
-        person_data = validated_data.get('person', {})
-        company_data = validated_data.get('company', {})
-        
-        key_components = []
-        if person_data:
-            key_components.append(f"person:{person_data.get('name', '').lower().strip()}")
-            key_components.append(f"p_phone:{person_data.get('phone', '').strip()}")
-        
-        if company_data:
-            key_components.append(f"company:{company_data.get('name', '').lower().strip()}")
-            key_components.append(f"c_reg:{company_data.get('registration_number', '').strip()}")
-        
-        key_string = ":".join(key_components)
-        return f"risk:{hashlib.md5(key_string.encode()).hexdigest()}"
-
     def _generate_recommendations(self, risk_calculation: Dict[str, Any], input_type: str) -> List[Dict[str, Any]]:
         """Generate recommendations based on risk assessment results"""
         recommendations = []
         
         # Add recommendations based on risk level
         risk_level = risk_calculation.get('risk_level', 'LOW')
-        if risk_level == 'HIGH':
+        risk_score = risk_calculation.get('risk_score', 0)
+        
+        if risk_level in ['very_high', 'high'] or risk_score >= 70:
             recommendations.append({
                 'type': 'high_risk',
                 'priority': 'high',
@@ -561,7 +823,7 @@ class RiskService:
                     'Consider additional verification steps'
                 ]
             })
-        elif risk_level == 'MEDIUM':
+        elif risk_level == 'medium' or risk_score >= 40:
             recommendations.append({
                 'type': 'medium_risk',
                 'priority': 'medium',
@@ -573,11 +835,13 @@ class RiskService:
                 ]
             })
         
-        # Add recommendations based on input type
+        # Add recommendations based on input type with enhanced priority for high-risk
+        priority = 'high' if risk_score >= 70 else 'medium'
+        
         if input_type == 'person_and_company':
             recommendations.append({
                 'type': 'relationship_analysis',
-                'priority': 'medium',
+                'priority': priority,
                 'message': 'Analyze person-company relationship',
                 'suggestions': [
                     'Review historical relationship data',
@@ -590,7 +854,7 @@ class RiskService:
         if input_type in ['company_only', 'person_and_company']:
             recommendations.append({
                 'type': 'director_analysis',
-                'priority': 'medium',
+                'priority': priority,
                 'message': 'Review director information',
                 'suggestions': [
                     'Verify director appointments',
@@ -599,4 +863,48 @@ class RiskService:
                 ]
             })
         
-        return recommendations 
+        return recommendations
+
+    def _generate_cache_key(self, entity_data: Dict[str, Any]) -> str:
+        """Generate cache key from entity data"""
+        # Create a stable string representation of the entity data
+        key_parts = []
+        
+        if entity_data.get('person'):
+            person = entity_data['person']
+            key_parts.extend([
+                person.get('name', ''),
+                person.get('email', ''),
+                person.get('phone', ''),
+                person.get('country', '')
+            ])
+        
+        if entity_data.get('company'):
+            company = entity_data['company']
+            key_parts.extend([
+                company.get('name', ''),
+                company.get('registration_number', ''),
+                company.get('country', '')
+            ])
+        
+        # Join parts and create a hash
+        key_string = '|'.join(filter(None, key_parts))
+        return f"risk_assessment:{hash(key_string)}"
+
+    def _get_risk_level(self, risk_score: int) -> str:
+        """Get risk level based on score with improved thresholds"""
+        if risk_score >= 75:
+            return 'very_high'
+        elif risk_score >= 60:
+            return 'high'
+        elif risk_score >= 40:
+            return 'medium'
+        elif risk_score >= 25:
+            return 'low'
+        else:
+            return 'very_low'
+
+    def set_fast_mode(self, enabled: bool):
+        """Enable or disable fast mode"""
+        self.fast_mode = enabled
+        logger.info(f"Fast mode {'enabled' if enabled else 'disabled'} for risk service") 

@@ -18,25 +18,26 @@ services:
       - risknet_network
 
   neo4j:
-    image: neo4j:latest
+    image: neo4j:5.14.0
     container_name: opensancton_neo4j
     ports:
       - "7474:7474"  # HTTP
       - "7687:7687"  # Bolt
     environment:
       - NEO4J_AUTH=neo4j/opensancton123
-      - NEO4J_dbms_security_auth__enabled=true
-      - NEO4J_dbms_memory_pagecache_size=1G
-      - NEO4J_dbms_memory_heap_initial__size=1G
-      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=1G
+      - NEO4J_server_memory_heap_initial__size=1G
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_config_strict__validation_enabled=false
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7474"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
     restart: unless-stopped
     networks:
       - risknet_network

@@ -1,24 +1,48 @@
 import logging
 import requests
+import json
 import os
 from typing import Dict, Any, List
 import time
-import config  # Import config module
+from config import (
+    SERPER_API_KEY, PERPLEXITY_API_KEY, 
+    MAX_WEB_RESULTS, API_TIMEOUT,
+    ENABLE_FAST_MODE
+)
 
 logger = logging.getLogger(__name__)
 
 class WebSearchService:
-    """Service for web intelligence gathering"""
+    """Web search service for real-time entity intelligence"""
     
     def __init__(self):
-        """Initialize web search service"""
+        self.fast_mode = False
         self.serper_api_key = os.getenv('SERPER_API_KEY')
         self.perplexity_api_key = os.getenv('PERPLEXITY_API_KEY')
-        self.fast_mode = False
-        logger.info("Web search service initialized")
+        self.trusted_sources = {
+            'reuters.com': 'News',
+            'bloomberg.com': 'News',
+            'wsj.com': 'News',
+            'ft.com': 'News',
+            'bbc.com': 'News',
+            'cnn.com': 'News',
+            'nytimes.com': 'News',
+            'washingtonpost.com': 'News',
+            'theguardian.com': 'News',
+            'apnews.com': 'News',
+            'opensanctions.org': 'Sanctions',
+            'treasury.gov': 'Government',
+            'fincen.gov': 'Government'
+        }
+        logger.info("Web search service initialized for real-time search")
+    
+    def set_fast_mode(self, enabled: bool):
+        """Set fast mode for optimized performance"""
+        self.fast_mode = enabled
+        logger.info(f"Web search fast mode {'enabled' if enabled else 'disabled'}")
     
     def search_entity(self, entity_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Search for entity information on the web"""
+        """Search for entity information using available APIs"""
         try:
             entity_name = entity_data.get('name', '')
             entity_type = entity_data.get('type', 'unknown')
@@ -32,22 +56,49 @@ class WebSearchService:
                     'sources_searched': []
                 }
             
-            # Build search query
-            query = self._build_search_query(entity_name, entity_type)
+            # Try real API searches first
+            results = []
+            sources_searched = []
             
-            # Perform search
-            search_results = self._perform_search(query)
+            # Try Serper API
+            if self.serper_api_key:
+                serper_results = self._search_with_serper(entity_name, entity_type)
+                results.extend(serper_results)
+                sources_searched.append('Serper API')
+            
+            # Try Perplexity API
+            if self.perplexity_api_key:
+                perplexity_results = self._search_with_perplexity(entity_name, entity_type)
+                results.extend(perplexity_results)
+                sources_searched.append('Perplexity API')
+            
+            # If no APIs available, return empty but valid response
+            if not results:
+                logger.info(f"No web search APIs available for {entity_name}")
+                return {
+                    'results': [],
+                    'total_results': 0,
+                    'risk_indicators': [],
+                    'sentiment_score': 0.0,
+                    'risk_score': 0,
+                    'trusted_sources_used': [],
+                    'sources_searched': sources_searched or ['No APIs configured']
+                }
             
             # Analyze results
-            risk_indicators = self._analyze_risk_indicators(search_results)
-            sentiment_score = self._calculate_sentiment(search_results)
+            risk_indicators = self._analyze_risk_indicators(results)
+            sentiment_score = self._calculate_sentiment(results)
+            risk_score = self._calculate_risk_score(results, risk_indicators)
             
             return {
-                'results': search_results,
-                'total_results': len(search_results),
+                'results': results[:MAX_WEB_RESULTS],  # Use configured limit
+                'total_results': len(results),
                 'risk_indicators': risk_indicators,
                 'sentiment_score': sentiment_score,
-                'sources_searched': ['Google via Serper']
+                'risk_score': risk_score,
+                'trusted_sources_used': self._get_trusted_sources_used(results),
+                'sources_searched': sources_searched,
+                'status': 'completed'
             }
             
         except Exception as e:
@@ -57,206 +108,225 @@ class WebSearchService:
                 'total_results': 0,
                 'risk_indicators': [],
                 'sentiment_score': 0.0,
-                'sources_searched': []
+                'risk_score': 0,
+                'trusted_sources_used': [],
+                'sources_searched': ['Error']
             }
     
-    def _build_search_query(self, entity_name: str, entity_type: str) -> str:
-        """Build search query based on entity type"""
-        # List of trusted news sources
-        trusted_sources = [
-            'theguardian.com',
-            'bbc.com',
-            'aljazeera.com',
-            'apnews.com',
-            'forbes.com',
-            'reuters.com',
-            'reddit.com'
-        ]
-        
-        # Build source filter
-        source_filter = ' OR '.join([f'site:{source}' for source in trusted_sources])
-        
-        if entity_type == 'company':
-            base_query = f'company: "{entity_name}" (sanctions OR criminal OR investigation)'
-        else:
-            base_query = f'person: "{entity_name}" (sanctions OR criminal OR investigation)'
-        
-        # Combine with source filter
-        return f'({base_query}) ({source_filter})'
-    
-    def _perform_search(self, query: str) -> List[Dict[str, Any]]:
-        """Perform web search using available APIs"""
-        if self.serper_api_key:
-            return self._search_serper(query)
-        elif self.perplexity_api_key:
-            return self._search_perplexity(query)
-        else:
-            # Mock results for testing
-            return [
-                {
-                    'title': 'Test Result 1',
-                    'url': 'https://example.com/test1',
-                    'source': 'example.com',
-                    'snippet': 'This is a test result about sanctions and criminal activity.',
-                    'relevance_score': 0.8,
-                    'search_engine': 'Google'
-                },
-                {
-                    'title': 'Test Result 2',
-                    'url': 'https://example.com/test2',
-                    'source': 'example.com',
-                    'snippet': 'Another test result about regulatory violations.',
-                    'relevance_score': 0.7,
-                    'search_engine': 'Google'
-                }
-            ]
-    
-    def _search_serper(self, query: str) -> List[Dict[str, Any]]:
+    def _search_with_serper(self, entity_name: str, entity_type: str) -> List[Dict[str, Any]]:
         """Search using Serper API"""
         try:
+            url = "https://google.serper.dev/search"
             headers = {
                 'X-API-KEY': self.serper_api_key,
                 'Content-Type': 'application/json'
             }
             
-            data = {
+            # Create search query
+            query = f'"{entity_name}" sanctions risk compliance investigation'
+            
+            payload = {
                 'q': query,
-                'gl': 'us',
-                'hl': 'en',
-                'num': 20,  # Increased to get more results
-                'type': 'search'  # Ensure we get web search results
+                'num': 10 if not self.fast_mode else 5
             }
             
-            response = requests.post(
-                'https://google.serper.dev/search',
-                headers=headers,
-                json=data
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
             
             if response.status_code == 200:
-                results = response.json()
-                organic_results = results.get('organic', [])
+                data = response.json()
+                results = []
                 
-                # Filter and process results
-                processed_results = []
-                for result in organic_results:
-                    source = result.get('source', '').lower()
-                    # Check if result is from a trusted source
-                    is_trusted = any(trusted in source for trusted in [
-                        'guardian', 'bbc', 'aljazeera', 'apnews', 
-                        'forbes', 'reuters', 'reddit'
-                    ])
-                    
-                    processed_results.append({
-                        'title': result.get('title', ''),
-                        'url': result.get('link', ''),
-                        'source': result.get('source', ''),
-                        'snippet': result.get('snippet', ''),
-                        'relevance_score': 0.9 if is_trusted else 0.7,  # Higher score for trusted sources
-                        'search_engine': 'Google',
-                        'is_trusted_source': is_trusted
+                for item in data.get('organic', []):
+                    results.append({
+                        'title': item.get('title', ''),
+                        'snippet': item.get('snippet', ''),
+                        'url': item.get('link', ''),
+                        'source': self._extract_domain(item.get('link', '')),
+                        'date': item.get('date', 'Unknown')
                     })
                 
-                # Sort results by relevance score
-                processed_results.sort(key=lambda x: x['relevance_score'], reverse=True)
-                return processed_results[:10]  # Return top 10 results
-            
-            return []
-            
+                logger.info(f"Serper API returned {len(results)} results for {entity_name}")
+                return results
+            else:
+                logger.warning(f"Serper API failed with status {response.status_code}")
+                return []
+                
         except Exception as e:
-            logger.error(f"Serper search failed: {str(e)}")
+            logger.error(f"Serper API search failed: {str(e)}")
             return []
     
-    def _search_perplexity(self, query: str) -> List[Dict[str, Any]]:
+    def _search_with_perplexity(self, entity_name: str, entity_type: str) -> List[Dict[str, Any]]:
         """Search using Perplexity API"""
         try:
+            url = "https://api.perplexity.ai/chat/completions"
             headers = {
                 'Authorization': f'Bearer {self.perplexity_api_key}',
                 'Content-Type': 'application/json'
             }
             
-            data = {
-                'query': query,
-                'max_results': 10
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"Search for recent news, sanctions, investigations, or compliance issues related to {entity_name}. Include sources and dates."
+                }
+            ]
+            
+            payload = {
+                "model": "llama-3.1-sonar-small-128k-online",
+                "messages": messages,
+                "max_tokens": 500 if self.fast_mode else 1000,
+                "temperature": 0.1,
+                "return_citations": True
             }
             
-            response = requests.post(
-                'https://api.perplexity.ai/search',
-                headers=headers,
-                json=data
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
             
             if response.status_code == 200:
-                results = response.json()
+                data = response.json()
+                content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                citations = data.get('citations', [])
                 
-                return [{
-                    'title': result.get('title', ''),
-                    'url': result.get('url', ''),
-                    'source': result.get('source', ''),
-                    'snippet': result.get('snippet', ''),
-                    'relevance_score': result.get('relevance_score', 0.8),
-                    'search_engine': 'Perplexity'
-                } for result in results]
-            
-            return []
-            
+                # Parse the response to extract structured results
+                results = self._parse_perplexity_response(content, citations, entity_name)
+                logger.info(f"Perplexity API returned {len(results)} results for {entity_name}")
+                return results
+            else:
+                logger.warning(f"Perplexity API failed with status {response.status_code}")
+                return []
+                
         except Exception as e:
-            logger.error(f"Perplexity search failed: {str(e)}")
+            logger.error(f"Perplexity API search failed: {str(e)}")
             return []
     
+    def _parse_perplexity_response(self, content: str, citations: List[Dict], entity_name: str) -> List[Dict[str, Any]]:
+        """Parse Perplexity API response into structured results"""
+        results = []
+        
+        # Extract information from citations
+        for citation in citations:
+            url = citation.get('url', '')
+            title = citation.get('title', '')
+            
+            if url and title:
+                results.append({
+                    'title': title,
+                    'snippet': content[:200] + '...' if len(content) > 200 else content,
+                    'url': url,
+                    'source': self._extract_domain(url),
+                    'date': 'Recent'
+                })
+        
+        # If no citations, create a single result from the content
+        if not results and content:
+            results.append({
+                'title': f'Intelligence Report on {entity_name}',
+                'snippet': content,
+                'url': 'https://perplexity.ai',
+                'source': 'perplexity.ai',
+                'date': 'Recent'
+            })
+        
+        return results
+    
+    def _extract_domain(self, url: str) -> str:
+        """Extract domain from URL"""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            # Remove www. prefix
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            return domain
+        except Exception:
+            return url
+    
     def _analyze_risk_indicators(self, results: List[Dict[str, Any]]) -> List[str]:
-        """Analyze search results for risk indicators"""
+        """Analyze results for risk indicators"""
         risk_indicators = []
         risk_keywords = {
-            'criminal': 'Criminal related',
-            'sanction': 'Sanctions related',
-            'violation': 'Regulatory related',
-            'investigation': 'Regulatory related',
-            'fraud': 'Criminal related',
-            'corruption': 'Criminal related',
-            'money laundering': 'Criminal related',
-            'terrorism': 'Sanctions related',
-            'sdn': 'Sanctions related',
-            'regulatory': 'Regulatory related'
+            'sanctions': ['sanctions', 'sanctioned', 'ofac', 'sdn list', 'embargo', 'asset freeze'],
+            'criminal': ['criminal', 'arrest', 'charged', 'convicted', 'fraud', 'embezzlement'],
+            'investigation': ['investigation', 'probe', 'inquiry', 'under investigation', 'being investigated'],
+            'money_laundering': ['money laundering', 'aml violation', 'financial crime', 'suspicious transactions'],
+            'terrorism': ['terrorism', 'terrorist', 'terror financing', 'terrorist organization'],
+            'corruption': ['corruption', 'bribery', 'corrupt', 'kickback', 'corrupt practices'],
+            'regulatory': ['regulatory violation', 'compliance violation', 'penalty', 'fine', 'settlement']
         }
         
         for result in results:
             text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
             
-            for keyword, category in risk_keywords.items():
-                if keyword in text:
-                    indicator = f"{category}: {keyword}"
+            for category, keywords in risk_keywords.items():
+                if any(keyword in text for keyword in keywords):
+                    indicator = f"{category.replace('_', ' ').title()} indicators found"
                     if indicator not in risk_indicators:
                         risk_indicators.append(indicator)
         
         return risk_indicators
     
     def _calculate_sentiment(self, results: List[Dict[str, Any]]) -> float:
-        """Calculate sentiment score from search results"""
+        """Calculate sentiment score from results"""
         if not results:
             return 0.0
         
-        # Simple sentiment analysis based on keywords
-        positive_words = {'success', 'growth', 'innovation', 'positive', 'achievement'}
-        negative_words = {'criminal', 'sanction', 'violation', 'investigation', 'fraud', 'corruption'}
+        negative_keywords = ['scandal', 'investigation', 'sanctions', 'criminal', 'fraud', 'violation', 'penalty']
+        positive_keywords = ['successful', 'award', 'achievement', 'growth', 'expansion', 'innovation']
         
-        total_score = 0.0
+        negative_count = 0
+        positive_count = 0
+        total_words = 0
+        
         for result in results:
             text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            words = text.split()
+            total_words += len(words)
             
-            # Count positive and negative words
-            positive_count = sum(1 for word in positive_words if word in text)
-            negative_count = sum(1 for word in negative_words if word in text)
-            
-            # Calculate score for this result (-1 to 1)
-            if positive_count + negative_count > 0:
-                score = (positive_count - negative_count) / (positive_count + negative_count)
-                total_score += score
+            for word in words:
+                if any(neg_word in word for neg_word in negative_keywords):
+                    negative_count += 1
+                elif any(pos_word in word for pos_word in positive_keywords):
+                    positive_count += 1
         
-        # Return average sentiment (-1 to 1)
-        return total_score / len(results) if results else 0.0
+        if total_words == 0:
+            return 0.0
+        
+        # Calculate sentiment score between -1 and 1
+        sentiment = (positive_count - negative_count) / max(total_words / 10, 1)
+        return max(-1.0, min(1.0, sentiment))
     
-    def set_fast_mode(self, enabled: bool):
-        """Enable or disable fast mode"""
-        self.fast_mode = enabled
-        logger.info(f"Web search fast mode {'enabled' if enabled else 'disabled'}") 
+    def _calculate_risk_score(self, results: List[Dict[str, Any]], risk_indicators: List[str]) -> int:
+        """Calculate risk score based on results"""
+        if not results:
+            return 0
+        
+        score = 0
+        
+        # Base score from number of risk indicators
+        score += len(risk_indicators) * 15
+        
+        # Additional score from trusted sources
+        trusted_results = [r for r in results if self._is_trusted_source(r.get('source', ''))]
+        score += len(trusted_results) * 10
+        
+        # High-risk keywords get extra points
+        high_risk_keywords = ['sanctions', 'terrorism', 'criminal', 'money laundering']
+        for result in results:
+            text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            if any(keyword in text for keyword in high_risk_keywords):
+                score += 20
+        
+        return min(100, score)
+    
+    def _is_trusted_source(self, source: str) -> bool:
+        """Check if source is trusted"""
+        return source.lower() in [domain.lower() for domain in self.trusted_sources.keys()]
+    
+    def _get_trusted_sources_used(self, results: List[Dict[str, Any]]) -> List[str]:
+        """Get list of trusted sources used"""
+        trusted_sources = []
+        for result in results:
+            source = result.get('source', '')
+            if self._is_trusted_source(source) and source not in trusted_sources:
+                trusted_sources.append(source)
+        return trusted_sources 

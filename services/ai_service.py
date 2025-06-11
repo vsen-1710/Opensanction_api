@@ -1,531 +1,388 @@
 import logging
-import os
-import requests
-from typing import Dict, Any, List
 import json
-import config  # Import config module
+import requests
+import os
+from typing import Dict, Any, List
+import time
+import re
+from config import (
+    OPENAI_API_KEY, DEEPSEEK_API_KEY, 
+    AI_MAX_TOKENS, AI_TEMPERATURE, API_TIMEOUT,
+    MAX_KEY_FINDINGS, MAX_RISK_INDICATORS,
+    ENABLE_FAST_MODE
+)
 
 logger = logging.getLogger(__name__)
 
 class AIService:
-    """Real AI service for risk analysis and summarization"""
+    """AI service for intelligent risk analysis"""
     
     def __init__(self):
-        self.openai_api_key = config.OPENAI_API_KEY
-        self.deepseek_api_key = config.DEEPSEEK_API_KEY
-        self.fast_mode = True  # Enable fast mode by default
-        
-        # Debug logging for API keys
-        logger.info(f"AIService initialized with OpenAI API key: {'Present' if self.openai_api_key else 'None'}")
-        logger.info(f"AIService initialized with DeepSeek API key: {'Present' if self.deepseek_api_key else 'None'}")
-        
-        logger.info("AI service initialized with real API keys")
+        self.fast_mode = False
+        self.openai_api_key = os.getenv('OPENAI_API_KEY')
+        self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY')
+        logger.info("AI service initialized for intelligent analysis")
     
-    def summarize_search_results(self, search_results: List[Dict], entity_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Summarize search results using real AI APIs"""
-        if not search_results:
-            # Try to use AI even with no results
-            if self.deepseek_api_key:
-                return {
-                    'summary': 'No search results available for analysis.',
-                    'risk_score': 0,
-                    'sentiment': 'neutral',
-                    'confidence': 0.1,
-                    'risk_indicators': [],
-                    'ai_provider': 'DeepSeek'
-                }
-            elif self.openai_api_key:
-                return {
-                    'summary': 'No search results available for analysis.',
-                    'risk_score': 0,
-                    'sentiment': 'neutral',
-                    'confidence': 0.1,
-                    'risk_indicators': [],
-                    'ai_provider': 'OpenAI'
-                }
-            else:
-                return {
-                    'summary': 'No search results available for analysis.',
-                    'risk_score': 0,
-                    'sentiment': 'neutral',
-                    'confidence': 0.1,
-                    'risk_indicators': [],
-                    'ai_provider': 'Fallback Analysis'
-                }
-        
-        # OPTIMIZATION: Limit results in fast mode for quicker processing
-        if self.fast_mode:
-            limited_results = search_results[:10]  # Top 10 results only
-            logger.info(f"Fast mode: Processing {len(limited_results)} of {len(search_results)} search results")
-        else:
-            limited_results = search_results[:15]  # Top 15 results
-        
-        content = self._prepare_content_for_analysis(limited_results, entity_data)
-        
-        # Try OpenAI first, then DeepSeek as fallback
-        result = None
-        
-        if self.openai_api_key:
-            result = self._summarize_with_openai(content, entity_data)
-            if result:
-                result['ai_provider'] = 'OpenAI'
-        
-        if not result and self.deepseek_api_key:
-            result = self._summarize_with_deepseek(content, entity_data)
-            if result:
-                result['ai_provider'] = 'DeepSeek'
-        
-        # Fallback to rule-based analysis
-        if not result:
-            result = self._create_fallback_summary(limited_results, entity_data)
-            result['ai_provider'] = 'Fallback Analysis'
-        
-        # Ensure all required fields are present
-        result = self._ensure_complete_response(result)
-        
-        return result
-
-    def _prepare_content_for_analysis(self, search_results: List[Dict], entity_data: Dict[str, Any]) -> str:
-        """Prepare search results content for AI analysis with optimizations"""
-        entity_name = entity_data.get('name', 'Unknown')
-        entity_company = entity_data.get('company', '')
-        
-        # OPTIMIZATION: Shorter content preparation in fast mode
-        if self.fast_mode:
-            content_parts = [
-                f"RISK ANALYSIS: {entity_name}",
-                f"Company: {entity_company}" if entity_company else "",
-                "",
-                "KEY SEARCH RESULTS:",
-                ""
-            ]
-            
-            # Limit to top 8 results and shorter snippets in fast mode
-            for i, result in enumerate(search_results[:8], 1):
-                source = result.get('source', 'Unknown')
-                title = result.get('title', 'No title')
-                snippet = result.get('snippet', 'No content')[:150]  # Shorter snippets
-                
-                content_parts.extend([
-                    f"[{i}] {source}: {title}",
-                    f"Content: {snippet}...",
-                    ""
-                ])
-        else:
-            # Full mode: comprehensive content
-            content_parts = [
-                f"RISK INTELLIGENCE ANALYSIS REQUEST",
-                f"Entity: {entity_name}",
-                f"Company: {entity_company}" if entity_company else "",
-                f"Country: {entity_data.get('country', 'Unknown')}",
-                "",
-                "SEARCH RESULTS FROM MAJOR NEWS SOURCES:",
-                ""
-            ]
-            
-            for i, result in enumerate(search_results[:15], 1):
-                source = result.get('source', 'Unknown')
-                title = result.get('title', 'No title')
-                snippet = result.get('snippet', 'No content')
-                
-                content_parts.extend([
-                    f"[{i}] Source: {source}",
-                    f"Title: {title}",
-                    f"Content: {snippet}",
-                    f"URL: {result.get('link', result.get('url', 'N/A'))}",
-                    ""
-                ])
-        
-        return "\n".join(content_parts)
+    def set_fast_mode(self, enabled: bool):
+        """Set fast mode for optimized performance"""
+        self.fast_mode = enabled
+        logger.info(f"AI service fast mode {'enabled' if enabled else 'disabled'}")
     
-    def _summarize_with_openai(self, content: str, entity_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Summarize using OpenAI GPT with optimizations"""
+    def summarize_search_results(self, search_results: List[Dict[str, Any]], entity_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Summarize search results using AI analysis"""
         try:
-            import openai
-            openai.api_key = self.openai_api_key
+            if not search_results:
+                return self._create_fallback_summary([], entity_data)
             
-            entity_name = entity_data.get('name', 'the entity')
+            entity_name = entity_data.get('name', 'Unknown')
+            entity_type = entity_data.get('type', 'unknown')
             
-            # OPTIMIZATION: Use different prompts and token limits based on mode
-            if self.fast_mode:
-                system_prompt = "You are a risk analyst. Analyze search results for sanctions, criminal activity, and regulatory violations. Provide concise structured analysis."
-                
-                user_prompt = f"""Quick risk analysis for {entity_name}:
-
-{content}
-
-JSON response:
-{{
-    "summary": "Brief risk assessment (max 150 words)",
-    "risk_indicators": ["risk 1", "risk 2"],
-    "sentiment": "positive|negative|neutral",
-    "confidence": 0.85,
-    "risk_score": 65,
-    "key_findings": ["finding 1", "finding 2"]
-}}"""
-                max_tokens = 500  # Reduced tokens for faster response
-            else:
-                # Full mode: comprehensive analysis
-                system_prompt = """You are an expert risk intelligence analyst specializing in financial crime, sanctions, and regulatory compliance. 
-
-Analyze the provided search results and create a comprehensive risk assessment. Focus on:
-
-1. SANCTIONS: Any mention of economic sanctions, asset freezes, or designated persons lists
-2. CRIMINAL ACTIVITY: Arrests, charges, convictions, investigations, fraud, money laundering
-3. REGULATORY ACTIONS: SEC investigations, banking violations, compliance issues, fines
-4. POLITICAL EXPOSURE: Government positions, politically exposed persons (PEP), political connections
-5. REPUTATIONAL RISKS: Scandals, controversies, negative media coverage
-6. BUSINESS RISKS: Corporate malfeasance, bankruptcy, regulatory violations
-
-Provide a structured analysis with specific evidence from the search results."""
-
-                user_prompt = f"""Analyze the following information about {entity_name} and provide a comprehensive risk assessment:
-
-{content}
-
-Respond in JSON format with:
-{{
-    "summary": "Detailed risk assessment summary (max 300 words)",
-    "risk_indicators": ["specific risk factor 1", "specific risk factor 2", ...],
-    "sentiment": "positive|negative|neutral",
-    "confidence": 0.85,
-    "risk_score": 75,
-    "key_findings": ["finding 1", "finding 2", ...],
-    "sources_cited": ["source 1", "source 2", ...]
-}}"""
-                max_tokens = 800  # Full tokens for comprehensive analysis
-
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=max_tokens,
-                temperature=0.1
-            )
+            # Try AI-powered analysis first
+            ai_summary = None
             
-            content_response = response.choices[0].message.content.strip()
+            # Try OpenAI
+            if self.openai_api_key:
+                ai_summary = self._analyze_with_openai(search_results, entity_name, entity_type)
             
-            # Try to parse JSON response
-            try:
-                result = json.loads(content_response)
-                return self._validate_ai_response(result)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, create structured response from text
-                return self._parse_text_response(content_response, entity_data)
-                
+            # Try DeepSeek if OpenAI failed
+            if not ai_summary and self.deepseek_api_key:
+                ai_summary = self._analyze_with_deepseek(search_results, entity_name, entity_type)
+            
+            # Fallback to rule-based analysis if no AI available
+            if not ai_summary:
+                logger.info(f"No AI APIs available, using rule-based analysis for {entity_name}")
+                return self._create_fallback_summary(search_results, entity_data)
+            
+            return ai_summary
+            
         except Exception as e:
-            logger.error(f"OpenAI summarization failed: {str(e)}")
-            return None
+            logger.error(f"AI analysis failed: {str(e)}")
+            return self._create_fallback_summary(search_results, entity_data)
     
-    def _summarize_with_deepseek(self, content: str, entity_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Summarize using DeepSeek API with optimizations"""
+    def _analyze_with_openai(self, search_results: List[Dict[str, Any]], entity_name: str, entity_type: str) -> Dict[str, Any]:
+        """Analyze using OpenAI API"""
         try:
-            entity_name = entity_data.get('name', 'the entity')
-            
-            url = "https://api.deepseek.com/chat/completions"
-            
+            url = "https://api.openai.com/v1/chat/completions"
             headers = {
-                "Authorization": f"Bearer {self.deepseek_api_key}",
-                "Content-Type": "application/json"
+                'Authorization': f'Bearer {self.openai_api_key}',
+                'Content-Type': 'application/json'
             }
             
-            # OPTIMIZATION: Adjust tokens and prompt based on mode
-            if self.fast_mode:
-                max_tokens = 500
-                prompt = f"""Quick risk analysis for {entity_name}:
-
-{content}
-
-JSON format:
-{{
-    "summary": "Brief risk assessment",
-    "risk_indicators": ["risk factors"],
-    "sentiment": "positive|negative|neutral",
-    "confidence": 0.8,
-    "risk_score": 65,
-    "key_findings": ["findings"]
-}}"""
+            # Prepare search results text
+            results_text = self._format_results_for_ai(search_results)
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a risk analyst specializing in sanctions, compliance, and entity due diligence. Analyze the provided search results and provide a comprehensive risk assessment."
+                },
+                {
+                    "role": "user",
+                    "content": f"Analyze these search results for {entity_name} ({entity_type}) and provide a risk assessment:\n\n{results_text}\n\nProvide: 1) Summary 2) Risk indicators 3) Key findings 4) Confidence level (0-1) 5) Sentiment (-1 to 1)"
+                }
+            ]
+            
+            payload = {
+                "model": "gpt-3.5-turbo" if ENABLE_FAST_MODE else "gpt-4",
+                "messages": messages,
+                "max_tokens": AI_MAX_TOKENS,
+                "temperature": AI_TEMPERATURE
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                return self._parse_ai_response(content, entity_name, 'OpenAI')
             else:
-                max_tokens = 800
-                prompt = f"""Analyze this information about {entity_name} for comprehensive risk assessment:
-
-{content}
-
-Provide analysis in JSON format:
-{{
-    "summary": "Detailed risk assessment summary",
-    "risk_indicators": ["specific risk factors found"],
-    "sentiment": "positive|negative|neutral",
-    "confidence": 0.8,
-    "risk_score": 65,
-    "key_findings": ["important findings"],
-    "sources_cited": ["sources mentioned"]
-}}"""
+                logger.warning(f"OpenAI API failed with status {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"OpenAI analysis failed: {str(e)}")
+            return None
+    
+    def _analyze_with_deepseek(self, search_results: List[Dict[str, Any]], entity_name: str, entity_type: str) -> Dict[str, Any]:
+        """Analyze using DeepSeek API"""
+        try:
+            url = "https://api.deepseek.com/v1/chat/completions"
+            headers = {
+                'Authorization': f'Bearer {self.deepseek_api_key}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Prepare search results text
+            results_text = self._format_results_for_ai(search_results)
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a risk analyst specializing in sanctions, compliance, and entity due diligence. Analyze the provided search results and provide a comprehensive risk assessment."
+                },
+                {
+                    "role": "user",
+                    "content": f"Analyze these search results for {entity_name} ({entity_type}) and provide a risk assessment:\n\n{results_text}\n\nProvide: 1) Summary 2) Risk indicators 3) Key findings 4) Confidence level (0-1) 5) Sentiment (-1 to 1)"
+                }
+            ]
             
             payload = {
                 "model": "deepseek-chat",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an expert risk intelligence analyst. Analyze search results for sanctions, criminal activity, regulatory violations, and other risk factors. Provide detailed, structured assessments."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.1
+                "messages": messages,
+                "max_tokens": AI_MAX_TOKENS,
+                "temperature": AI_TEMPERATURE
             }
             
-            # OPTIMIZATION: Shorter timeout in fast mode
-            timeout = 20 if self.fast_mode else 30
+            response = requests.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
             
-            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            
-            data = response.json()
-            content_response = data.get('choices', [{}])[0].get('message', {}).get('content', '')
-            
-            # Try to parse JSON response
-            try:
-                result = json.loads(content_response)
-                return self._validate_ai_response(result)
-            except json.JSONDecodeError:
-                return self._parse_text_response(content_response, entity_data)
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                return self._parse_ai_response(content, entity_name, 'DeepSeek')
+            else:
+                logger.warning(f"DeepSeek API failed with status {response.status_code}")
+                return None
                 
         except Exception as e:
-            logger.error(f"DeepSeek summarization failed: {str(e)}")
+            logger.error(f"DeepSeek analysis failed: {str(e)}")
             return None
-
-    def set_fast_mode(self, enabled: bool):
-        """Enable or disable fast mode for AI processing"""
-        self.fast_mode = enabled
-        logger.info(f"AI service fast mode {'enabled' if enabled else 'disabled'}")
-
-    def _validate_ai_response(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and normalize AI response"""
-        # Ensure required fields exist
-        validated = {
-            'summary': result.get('summary', 'Analysis completed'),
-            'risk_indicators': result.get('risk_indicators', []),
-            'sentiment': result.get('sentiment', 'neutral'),
-            'confidence': min(max(result.get('confidence', 0.5), 0.0), 1.0),
-            'risk_score': min(max(result.get('risk_score', 0), 0), 100),
-            'key_findings': result.get('key_findings', []),
-            'sources_cited': result.get('sources_cited', [])
-        }
-        
-        # Validate sentiment
-        if validated['sentiment'] not in ['positive', 'negative', 'neutral']:
-            validated['sentiment'] = 'neutral'
-        
-        return validated
     
-    def _parse_text_response(self, text_response: str, entity_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse text response when JSON parsing fails"""
+    def _format_results_for_ai(self, search_results: List[Dict[str, Any]]) -> str:
+        """Format search results for AI analysis"""
+        formatted_results = []
+        
+        for i, result in enumerate(search_results[:10], 1):  # Limit to top 10 results
+            title = result.get('title', 'No title')
+            snippet = result.get('snippet', 'No description')
+            source = result.get('source', 'Unknown source')
+            date = result.get('date', 'Unknown date')
+            
+            formatted_results.append(f"{i}. Title: {title}\n   Source: {source}\n   Date: {date}\n   Content: {snippet}\n")
+        
+        return "\n".join(formatted_results)
+    
+    def _parse_ai_response(self, content: str, entity_name: str, ai_provider: str) -> Dict[str, Any]:
+        """Parse AI response into structured format"""
+        if not content:
+            return {
+                'summary': f"AI analysis completed for {entity_name}",
+                'risk_indicators': [],
+                'sentiment': 0.0,
+                'confidence': 0.5,
+                'key_findings': [],
+                'sources_cited': [],
+                'ai_provider': ai_provider
+            }
+
+        try:
+            # Extract risk indicators, key findings, etc. from the AI response
+            risk_indicators = self._extract_risk_indicators_from_text(content)
+            key_findings = self._extract_key_findings_from_text(content)
+            confidence = self._extract_confidence_from_text(content)
+            sentiment = self._extract_sentiment_from_text(content)
+            
+            # Clean up the summary - avoid truncation mid-sentence
+            summary = content
+            if len(content) > 500:
+                # Find the last complete sentence within 500 characters
+                truncated = content[:500]
+                last_period = truncated.rfind('.')
+                last_exclamation = truncated.rfind('!')
+                last_question = truncated.rfind('?')
+                
+                # Find the last sentence ending
+                last_sentence_end = max(last_period, last_exclamation, last_question)
+                
+                if last_sentence_end > 200:  # Ensure we have a reasonable amount of content
+                    summary = content[:last_sentence_end + 1]
+                else:
+                    # If no good sentence break, truncate at last word boundary
+                    truncated = content[:500]
+                    last_space = truncated.rfind(' ')
+                    if last_space > 200:
+                        summary = content[:last_space] + "..."
+                    else:
+                        summary = truncated + "..."
+            
+            return {
+                'summary': summary,
+                'risk_indicators': risk_indicators,
+                'sentiment': sentiment,
+                'confidence': confidence,
+                'key_findings': key_findings,
+                'sources_cited': [],  # Would be extracted from the AI response
+                'ai_provider': ai_provider
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to parse AI response: {str(e)}")
+            return {
+                'summary': content[:500] if content else f"AI analysis completed for {entity_name}",
+                'risk_indicators': [],
+                'sentiment': 0.0,
+                'confidence': 0.5,
+                'key_findings': [],
+                'sources_cited': [],
+                'ai_provider': ai_provider
+            }
+    
+    def _extract_risk_indicators_from_text(self, text: str) -> List[str]:
+        """Extract risk indicators from AI response text"""
         risk_indicators = []
-        sentiment = 'neutral'
+        text_lower = text.lower()
         
-        text_lower = text_response.lower()
-        
-        # Extract risk indicators using keyword matching
-        risk_keywords = {
-            'sanctions': ['sanction', 'ofac', 'sdn', 'embargo'],
-            'criminal': ['criminal', 'fraud', 'embezzlement', 'money laundering'],
-            'investigation': ['investigation', 'probe', 'inquiry'],
-            'regulatory': ['regulatory', 'violation', 'penalty', 'fine'],
-            'pep': ['politically exposed', 'pep', 'government official'],
-            'corruption': ['corruption', 'bribery', 'kickback']
+        # Look for common risk patterns in the AI response
+        risk_patterns = {
+            'sanctions': 'sanctions indicators',
+            'investigation': 'under investigation',
+            'criminal': 'criminal activity',
+            'terrorism': 'terrorism related',
+            'corruption': 'corruption allegations',
+            'money laundering': 'money laundering',
+            'financial crime': 'financial crimes'
         }
         
-        for category, keywords in risk_keywords.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    risk_indicators.append(f"{category.title()} related: {keyword}")
+        for pattern, indicator in risk_patterns.items():
+            if pattern in text_lower:
+                risk_indicators.append(indicator)
         
-        # Determine sentiment
-        negative_indicators = ['sanction', 'criminal', 'fraud', 'investigation', 'violation']
-        positive_indicators = ['cleared', 'compliant', 'ethical', 'legitimate']
+        return risk_indicators
+    
+    def _extract_key_findings_from_text(self, text: str) -> List[str]:
+        """Extract key findings from AI response"""
+        key_findings = []
         
-        negative_count = sum(1 for indicator in negative_indicators if indicator in text_lower)
-        positive_count = sum(1 for indicator in positive_indicators if indicator in text_lower)
+        # Look for bullet points, numbered items, or key phrases
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith(('•', '-', '*', '1.', '2.', '3.')) or 'finding' in line.lower():
+                if len(line) > 10:  # Avoid very short lines
+                    # Don't truncate - use full line, but limit total findings
+                    key_findings.append(line)
+        
+        # Filter out incomplete findings (those that end with common incomplete patterns)
+        complete_findings = []
+        for finding in key_findings:
+            # Skip if it's just a header or incomplete sentence
+            if (not finding.endswith((':', 'which are', 'that', 'and', 'or', 'but', 'with')) and 
+                len(finding.split()) > 3 and
+                not finding.lower().strip() in ['key findings:', '3) key findings:']):
+                complete_findings.append(finding)
+        
+        return complete_findings[:MAX_KEY_FINDINGS]  # Use configured limit
+    
+    def _extract_confidence_from_text(self, text: str) -> float:
+        """Extract confidence level from AI response"""
+        text_lower = text.lower()
+        
+        # Look for confidence indicators
+        if 'high confidence' in text_lower or 'very confident' in text_lower:
+            return 0.9
+        elif 'medium confidence' in text_lower or 'moderately confident' in text_lower:
+            return 0.7
+        elif 'low confidence' in text_lower or 'uncertain' in text_lower:
+            return 0.3
+        else:
+            return 0.5  # Default confidence
+    
+    def _extract_sentiment_from_text(self, text: str) -> float:
+        """Extract sentiment from AI response"""
+        text_lower = text.lower()
+        
+        # Look for sentiment indicators
+        negative_words = ['negative', 'concern', 'risk', 'problem', 'issue', 'violation']
+        positive_words = ['positive', 'clean', 'compliant', 'good', 'clear']
+        
+        negative_count = sum(1 for word in negative_words if word in text_lower)
+        positive_count = sum(1 for word in positive_words if word in text_lower)
         
         if negative_count > positive_count:
-            sentiment = 'negative'
+            return -0.5
         elif positive_count > negative_count:
-            sentiment = 'positive'
-        
-        return {
-            'summary': text_response[:200] + '...' if len(text_response) > 200 else text_response,
-            'risk_indicators': list(set(risk_indicators)),  # Remove duplicates
-            'sentiment': sentiment,
-            'confidence': min(0.7, len(risk_indicators) * 0.1 + 0.3)
-        }
+            return 0.5
+        else:
+            return 0.0
     
     def _create_fallback_summary(self, search_results: List[Dict], entity_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create fallback summary using rule-based analysis"""
         entity_name = entity_data.get('name', 'Unknown')
         risk_indicators = []
-        negative_results = 0
-        total_results = len(search_results)
+        key_findings = []
+        sources_cited = []
         
-        # Analyze search results for risk keywords
-        risk_keywords = [
-            'sanctions', 'criminal', 'fraud', 'investigation', 'corruption',
-            'money laundering', 'violation', 'penalty', 'regulatory action',
-            'pep', 'politically exposed'
-        ]
+        # Enhanced risk keywords mapping
+        risk_keywords_map = {
+            'sanctions': ['sanctions', 'ofac', 'sdn list', 'embargo', 'asset freeze'],
+            'criminal': ['criminal', 'fraud', 'embezzlement', 'money laundering', 'arrest', 'charge'],
+            'investigation': ['investigation', 'probe', 'inquiry', 'under investigation'],
+            'regulatory': ['regulatory violation', 'compliance violation', 'penalty', 'fine', 'settlement'],
+            'pep': ['politically exposed', 'pep', 'government official', 'political figure'],
+            'corruption': ['corruption', 'bribery', 'kickback', 'corrupt practices'],
+            'terrorism': ['terrorism', 'terrorist', 'terror financing']
+        }
         
+        # Analyze results for risk indicators
         for result in search_results:
-            title = result.get('title', '').lower()
-            snippet = result.get('snippet', '').lower()
-            content = f"{title} {snippet}"
+            text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            source = result.get('source', '')
             
-            for keyword in risk_keywords:
-                if keyword in content:
-                    risk_indicators.append(f"Found '{keyword}' in search results")
-                    negative_results += 1
-                    break
+            if source:
+                sources_cited.append(source)
+            
+            for category, keywords in risk_keywords_map.items():
+                if any(keyword in text for keyword in keywords):
+                    indicator = f"{category.title()} related activity"
+                    if indicator not in risk_indicators:
+                        risk_indicators.append(indicator)
+                    key_findings.append(f"Found {category} related information in {source}")
         
         # Generate summary
         if risk_indicators:
-            summary = f"Analysis of {entity_name} found {len(risk_indicators)} potential risk indicators in search results. "
-            summary += f"Key concerns include: {', '.join(risk_indicators[:3])}."
-            sentiment = 'negative'
+            summary = f"Analysis of {entity_name} indicates the following risk factors: " + ", ".join(risk_indicators[:3])
         else:
-            summary = f"Analysis of {entity_name} did not identify significant risk indicators in available search results."
-            sentiment = 'neutral'
+            summary = f"No significant risk indicators found for {entity_name} based on available information."
         
-        confidence = min(0.6, (total_results * 0.1))
+        # Calculate confidence based on number of sources
+        confidence = min(0.8, len(search_results) * 0.1) if search_results else 0.1
+        
+        # Calculate sentiment
+        sentiment = self._calculate_sentiment_from_results(search_results)
         
         return {
             'summary': summary,
-            'risk_indicators': list(set(risk_indicators)),
+            'risk_indicators': risk_indicators[:MAX_RISK_INDICATORS],
             'sentiment': sentiment,
-            'confidence': confidence
+            'confidence': confidence,
+            'key_findings': key_findings[:MAX_KEY_FINDINGS],
+            'sources_cited': list(set(sources_cited))[:MAX_RISK_INDICATORS],
+            'ai_provider': 'Rule-based Analysis'
         }
     
-    def analyze_entity_connections(self, entity_data: Dict[str, Any], connections: List[Dict]) -> Dict[str, Any]:
-        """Analyze entity connections for risk assessment"""
-        if not connections:
-            return {
-                'analysis': 'No connections available for analysis.',
-                'risk_score': 0,
-                'high_risk_connections': []
-            }
+    def _calculate_sentiment_from_results(self, search_results: List[Dict[str, Any]]) -> float:
+        """Calculate sentiment from search results"""
+        if not search_results:
+            return 0.0
         
-        high_risk_connections = []
-        risk_score = 0
+        negative_keywords = ['sanctions', 'investigation', 'criminal', 'fraud', 'violation', 'penalty']
+        positive_keywords = ['compliant', 'cleared', 'exonerated', 'approved', 'legitimate']
         
-        for connection in connections:
-            connection_risk = connection.get('risk_level', 'LOW')
-            if connection_risk == 'HIGH':
-                high_risk_connections.append(connection)
-                risk_score += 30
-            elif connection_risk == 'MEDIUM':
-                risk_score += 10
+        negative_count = 0
+        positive_count = 0
         
-        # Cap risk score at 100
-        risk_score = min(risk_score, 100)
+        for result in search_results:
+            text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            
+            for keyword in negative_keywords:
+                if keyword in text:
+                    negative_count += 1
+            
+            for keyword in positive_keywords:
+                if keyword in text:
+                    positive_count += 1
         
-        if high_risk_connections:
-            analysis = f"Entity has {len(high_risk_connections)} high-risk connections. "
-            analysis += "This significantly increases the overall risk profile."
-        else:
-            analysis = "No high-risk connections identified in the network analysis."
+        total = negative_count + positive_count
+        if total == 0:
+            return 0.0
         
-        return {
-            'analysis': analysis,
-            'risk_score': risk_score,
-            'high_risk_connections': high_risk_connections[:5],  # Limit to top 5
-            'total_connections': len(connections)
-        }
-    
-    def _ensure_complete_response(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure the response has all required fields"""
-        complete_result = {
-            'summary': result.get('summary', 'Risk analysis completed'),
-            'risk_indicators': result.get('risk_indicators', []),
-            'sentiment': result.get('sentiment', 'neutral'),
-            'confidence': result.get('confidence', 0.5),
-            'risk_score': result.get('risk_score', 0),
-            'key_findings': result.get('key_findings', []),
-            'sources_cited': result.get('sources_cited', []),
-            'ai_provider': result.get('ai_provider', 'Unknown'),
-            'detailed_analysis': {
-                'risk_categories': self._categorize_risks(result.get('risk_indicators', [])),
-                'confidence_factors': self._calculate_confidence_factors(result),
-                'recommendations': self._generate_recommendations(result)
-            }
-        }
-        
-        # Ensure sentiment is valid
-        if complete_result['sentiment'] not in ['positive', 'negative', 'neutral']:
-            complete_result['sentiment'] = 'neutral'
-        
-        # Ensure confidence is in valid range
-        complete_result['confidence'] = min(max(complete_result['confidence'], 0.0), 1.0)
-        
-        # Ensure risk score is in valid range
-        complete_result['risk_score'] = min(max(complete_result['risk_score'], 0), 100)
-        
-        return complete_result
-
-    def _categorize_risks(self, risk_indicators: List[str]) -> Dict[str, List[str]]:
-        """Categorize risk indicators into different risk types"""
-        categories = {
-            'financial': [],
-            'legal': [],
-            'reputational': [],
-            'compliance': [],
-            'other': []
-        }
-        
-        for indicator in risk_indicators:
-            indicator_lower = indicator.lower()
-            if any(word in indicator_lower for word in ['fraud', 'money', 'laundering', 'financial']):
-                categories['financial'].append(indicator)
-            elif any(word in indicator_lower for word in ['criminal', 'legal', 'sanction']):
-                categories['legal'].append(indicator)
-            elif any(word in indicator_lower for word in ['reputation', 'negative', 'sentiment']):
-                categories['reputational'].append(indicator)
-            elif any(word in indicator_lower for word in ['compliance', 'regulation', 'pep']):
-                categories['compliance'].append(indicator)
-            else:
-                categories['other'].append(indicator)
-        
-        return categories
-
-    def _calculate_confidence_factors(self, result: Dict[str, Any]) -> Dict[str, float]:
-        """Calculate confidence factors for different aspects of the analysis"""
-        return {
-            'data_quality': min(1.0, len(result.get('sources_cited', [])) * 0.2),
-            'risk_consistency': min(1.0, len(result.get('risk_indicators', [])) * 0.1),
-            'source_reliability': min(1.0, sum(1 for s in result.get('sources_cited', []) 
-                                             if any(domain in s.lower() for domain in 
-                                                  ['.gov', '.org', 'reuters', 'bloomberg'])) * 0.2)
-        }
-
-    def _generate_recommendations(self, result: Dict[str, Any]) -> List[str]:
-        """Generate recommendations based on risk assessment"""
-        recommendations = []
-        risk_level = result.get('risk_level', 'low')
-        risk_indicators = result.get('risk_indicators', [])
-        
-        if risk_level in ['high', 'very_high']:
-            recommendations.append("Immediate enhanced due diligence recommended")
-            recommendations.append("Consider additional verification of identity and background")
-        
-        if any('fraud' in indicator.lower() for indicator in risk_indicators):
-            recommendations.append("Conduct detailed financial transaction analysis")
-        
-        if any('pep' in indicator.lower() for indicator in risk_indicators):
-            recommendations.append("Implement enhanced monitoring procedures")
-        
-        if len(risk_indicators) > 3:
-            recommendations.append("Regular risk reassessment recommended")
-        
-        return recommendations 
+        return (positive_count - negative_count) / total 

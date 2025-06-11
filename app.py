@@ -2,11 +2,12 @@ import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from utils.cache import CacheManager
-from services.risk_service import RiskService
+from services.risk_service import RiskService, RisknetError
 from utils.validation import InputValidator
 from utils.errors import RisknetError
 import config  # Import config module
 import time
+from utils.performance_monitor import PerformanceMonitor
 
 # Configure logging
 logging.basicConfig(
@@ -20,8 +21,9 @@ CORS(app)
 
 # Initialize services
 cache_manager = CacheManager()
-risk_service = RiskService(cache_manager)
+risk_service = RiskService()
 validator = InputValidator()
+performance_monitor = PerformanceMonitor()
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -30,9 +32,9 @@ def health_check():
         'status': 'healthy',
         'service': 'Risknet API',
         'version': '1.0.0',
-        'fast_mode_enabled': risk_service.enable_fast_mode,
+        'fast_mode_enabled': risk_service.fast_mode,
         'optimizations': {
-            'parallel_processing': risk_service.enable_fast_mode,
+            'parallel_processing': risk_service.fast_mode,
             'web_search_fast_mode': risk_service.web_search_service.fast_mode,
             'ai_fast_mode': risk_service.ai_service.fast_mode
         },
@@ -68,12 +70,12 @@ def set_fast_mode():
 def get_performance_status():
     """Get current performance optimization status"""
     return jsonify({
-        'performance_mode': 'fast' if risk_service.enable_fast_mode else 'full',
+        'performance_mode': 'fast' if risk_service.fast_mode else 'full',
         'optimizations': {
-            'risk_service_fast_mode': risk_service.enable_fast_mode,
+            'risk_service_fast_mode': risk_service.fast_mode,
             'web_search_fast_mode': risk_service.web_search_service.fast_mode,
             'ai_fast_mode': risk_service.ai_service.fast_mode,
-            'parallel_processing': risk_service.enable_fast_mode,
+            'parallel_processing': risk_service.fast_mode,
             'caching_enabled': True
         },
         'api_availability': {
@@ -83,20 +85,22 @@ def get_performance_status():
             'perplexity_api': bool(risk_service.web_search_service.perplexity_api_key)
         },
         'speed_estimates': {
-            'person_only': '2-5 seconds' if risk_service.enable_fast_mode else '4-8 seconds',
-            'company_only': '3-6 seconds' if risk_service.enable_fast_mode else '5-10 seconds',
-            'person_and_company': '4-8 seconds (parallel)' if risk_service.enable_fast_mode else '8-15 seconds (sequential)',
+            'person_only': '2-5 seconds' if risk_service.fast_mode else '4-8 seconds',
+            'company_only': '3-6 seconds' if risk_service.fast_mode else '5-10 seconds',
+            'person_and_company': '4-8 seconds (parallel)' if risk_service.fast_mode else '8-15 seconds (sequential)',
             'cached_requests': '< 0.1 seconds'
         }
     })
 
 @app.route('/api/check_risk', methods=['POST'])
 def check_risk():
-    """Enhanced risk assessment endpoint with flexible input handling"""
+    """Enhanced risk assessment endpoint with flexible input handling and integrated relationship analysis"""
+    start_time = time.time()
     try:
         # Get request data
         request_data = request.get_json()
         if not request_data:
+            performance_monitor.track_request('/api/check_risk', start_time, False)
             return jsonify({
                 'error': 'Request body is required',
                 'message': 'Please provide either person details, company details, or both'
@@ -106,6 +110,7 @@ def check_risk():
         try:
             validated_data = validator.validate_risk_assessment_input(request_data)
         except ValueError as e:
+            performance_monitor.track_request('/api/check_risk', start_time, False)
             return jsonify({
                 'error': 'Input validation failed',
                 'message': str(e)
@@ -113,9 +118,9 @@ def check_risk():
         
         # Log the assessment type
         input_type = validated_data.get('input_type')
-        logger.info(f"Processing {input_type} risk assessment")
+        logger.info(f"Processing {input_type} risk assessment with integrated relationship analysis")
         
-        # Perform comprehensive risk assessment
+        # Perform comprehensive risk assessment (includes relationship analysis)
         risk_result = risk_service.assess_risk(validated_data)
         
         # Add input metadata to response
@@ -125,13 +130,16 @@ def check_risk():
                 'person': bool(validated_data.get('person')),
                 'company': bool(validated_data.get('company'))
             },
-            'validation_passed': True
+            'validation_passed': True,
+            'includes_relationship_analysis': True
         }
         
+        performance_monitor.track_request('/api/check_risk', start_time, True)
         return jsonify(risk_result)
         
     except RisknetError as e:
-        logger.error(f"Risknet error: {str(e)}")
+        logger.error(f"Risk assessment failed: {str(e)}")
+        performance_monitor.track_request('/api/check_risk', start_time, False)
         return jsonify({
             'error': 'Risk assessment failed',
             'message': str(e)
@@ -139,50 +147,25 @@ def check_risk():
         
     except Exception as e:
         logger.error(f"Unexpected error in risk assessment: {str(e)}")
+        performance_monitor.track_request('/api/check_risk', start_time, False)
         return jsonify({
             'error': 'Internal server error',
             'message': 'An unexpected error occurred during risk assessment'
         }), 500
 
-@app.route('/api/entity/<entity_id>/graph', methods=['GET'])
-def get_entity_graph(entity_id):
-    """Get graph data for an entity"""
-    try:
-        graph_data = risk_service.get_entity_graph(entity_id)
-        return jsonify(graph_data)
-    except Exception as e:
-        logger.error(f"Failed to get graph data: {str(e)}")
-        return jsonify({
-            'error': 'Graph data unavailable',
-            'message': str(e)
-        }), 500
-
-@app.route('/api/entity/<entity_id>/relationships', methods=['GET'])
-def get_entity_relationships(entity_id):
-    """Get all relationships for an entity (person belongs to company, company associated with person)"""
-    try:
-        relationships = risk_service.neo4j_service.find_entity_relationships(entity_id)
-        return jsonify({
-            'entity_id': entity_id,
-            'relationships': relationships,
-            'timestamp': int(time.time())
-        })
-    except Exception as e:
-        logger.error(f"Failed to get entity relationships: {str(e)}")
-        return jsonify({
-            'error': 'Entity relationships unavailable',
-            'message': str(e),
-            'entity_id': entity_id
-        }), 500
-
 @app.route('/api/stats', methods=['GET'])
 def get_statistics():
     """Get API statistics and status"""
+    start_time = time.time()
     try:
         stats = risk_service.get_statistics()
+        performance_stats = performance_monitor.get_metrics()
+        stats['performance_metrics'] = performance_stats
+        performance_monitor.track_request('/api/stats', start_time, True)
         return jsonify(stats)
     except Exception as e:
         logger.error(f"Failed to get statistics: {str(e)}")
+        performance_monitor.track_request('/api/stats', start_time, False)
         return jsonify({
             'error': 'Statistics unavailable',
             'message': str(e)
@@ -191,14 +174,17 @@ def get_statistics():
 @app.route('/api/cache/clear', methods=['POST'])
 def clear_cache():
     """Clear the cache"""
+    start_time = time.time()
     try:
         cache_manager.clear()
+        performance_monitor.track_request('/api/cache/clear', start_time, True)
         return jsonify({
             'message': 'Cache cleared successfully',
             'timestamp': cache_manager._get_timestamp()
         })
     except Exception as e:
         logger.error(f"Failed to clear cache: {str(e)}")
+        performance_monitor.track_request('/api/cache/clear', start_time, False)
         return jsonify({
             'error': 'Failed to clear cache',
             'message': str(e)
@@ -212,9 +198,7 @@ def not_found(error):
         'message': 'The requested endpoint does not exist',
         'available_endpoints': [
             'GET /health',
-            'POST /api/check_risk',
-            'GET /api/entity/<id>/graph',
-            'GET /api/entity/<id>/relationships',
+            'POST /api/check_risk (includes relationship analysis)',
             'GET /api/stats',
             'POST /api/performance/fast-mode',
             'GET /api/performance/status',

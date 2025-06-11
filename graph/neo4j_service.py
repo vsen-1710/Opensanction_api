@@ -2,6 +2,7 @@ import logging
 import os
 from typing import Dict, Any, List, Optional
 from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable, AuthError, ClientError
 import hashlib
 import time
 import uuid
@@ -12,17 +13,51 @@ logger = logging.getLogger(__name__)
 class Neo4jService:
     """Service for graph database operations"""
     
-    def __init__(self):
-        """Initialize Neo4j connection"""
+    def __init__(self, uri: str = None, user: str = None, password: str = None):
+        """Initialize Neo4j connection with connection retry logic"""
+        self.uri = uri or "bolt://opensancton_neo4j:7687"
+        self.user = user or "neo4j"
+        self.password = password or "password"
+        self.driver = None
+        self.max_retries = 3
+        self.retry_delay = 2  # seconds
+        
+        # Try to establish connection with retries
+        self._connect_with_retry()
+    
+    def _connect_with_retry(self):
+        """Attempt to connect to Neo4j with retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                self.driver = GraphDatabase.driver(
+                    self.uri,
+                    auth=(self.user, self.password),
+                    max_connection_lifetime=3600
+                )
+                # Test connection
+                with self.driver.session() as session:
+                    session.run("RETURN 1")
+                logger.info("Successfully connected to Neo4j")
+                return
+            except (ServiceUnavailable, AuthError, ClientError) as e:
+                if attempt < self.max_retries - 1:
+                    logger.warning(f"Neo4j connection attempt {attempt + 1} failed: {str(e)}. Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                else:
+                    logger.error(f"Failed to connect to Neo4j after {self.max_retries} attempts: {str(e)}")
+                    raise
+    
+    def _execute_query(self, query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Execute a Neo4j query with error handling"""
+        if not self.driver:
+            raise ServiceUnavailable("Neo4j driver not initialized")
+        
         try:
-            self.driver = GraphDatabase.driver(
-                config.NEO4J_URI,
-                auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD)
-            )
-            self._create_constraints()
-            logger.info("Successfully connected to Neo4j database")
+            with self.driver.session() as session:
+                result = session.run(query, parameters or {})
+                return [dict(record) for record in result]
         except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {str(e)}")
+            logger.error(f"Query execution failed: {str(e)}")
             raise
     
     def _create_constraints(self):
@@ -439,128 +474,70 @@ class Neo4jService:
 
     def create_person_company_relationship(self, person_id: str, company_id: str, 
                                          relationship_type: str = "ASSOCIATED_WITH") -> bool:
-        """Create relationship between person and company"""
-        try:
-            with self.driver.session() as session:
-                result = session.run("""
-                    MATCH (p:Person {id: $person_id})
-                    MATCH (c:Company {id: $company_id})
-                    MERGE (p)-[r:ASSOCIATED_WITH]->(c)
-                    SET r.type = $relationship_type,
-                        r.created_at = $timestamp
-                    RETURN r
-                """,
-                    person_id=person_id,
-                    company_id=company_id,
-                    relationship_type=relationship_type,
-                    timestamp=int(time.time())
-                )
+            """Create relationship between person and company"""
+            try:
+                query = """
+                MATCH (p:Entity {id: $person_id})
+                MATCH (c:Entity {id: $company_id})
+                MERGE (p)-[r:ASSOCIATED_WITH]->(c)
+                SET r.type = $relationship_type,
+                    r.created_at = $timestamp
+                RETURN r
+                """
                 
-                return result.single() is not None
+                result = self._execute_query(query, {
+                    'person_id': person_id,
+                    'company_id': company_id,
+                    'relationship_type': relationship_type,
+                    'timestamp': int(time.time())
+                })
                 
-        except Exception as e:
-            logger.error(f"Failed to create person-company relationship: {str(e)}")
-            return False
+                return bool(result)
+                
+            except Exception as e:
+                logger.error(f"Failed to create person-company relationship: {str(e)}")
+                return False
 
-    def find_entity_relationships(self, entity_id: str) -> Dict[str, Any]:
-        """Find all relationships for an entity (person belongs to company, company associated with person)"""
+    def find_entity_relationships(self, entity_id: str) -> dict:
+        """Find all relationships for a given entity."""
         try:
+            if not self.driver:
+                raise RisknetError("Neo4j driver not initialized")
+
             with self.driver.session() as session:
-                # Get entity details first
-                entity_result = session.run("""
-                    MATCH (e:Entity {id: $entity_id})
-                    RETURN e, labels(e) as labels
-                """, entity_id=entity_id).single()
+                # Query to find all relationships
+                query = """
+                MATCH (e {id: $entity_id})-[r]-(related)
+                RETURN type(r) as relationship_type,
+                       e.name as entity_name,
+                       related.name as related_name,
+                       related.id as related_id,
+                       related.type as related_type
+                """
                 
-                if not entity_result:
-                    return {
-                        'entity_found': False,
-                        'relationships': {}
+                result = session.run(query, entity_id=entity_id)
+                relationships = []
+                
+                for record in result:
+                    relationship = {
+                        'type': record['relationship_type'],
+                        'entity_name': record['entity_name'],
+                        'related_name': record['related_name'],
+                        'related_id': record['related_id'],
+                        'related_type': record['related_type']
                     }
-                
-                entity_labels = entity_result['labels']
-                relationships = {}
-                
-                # If it's a person, find associated companies
-                if 'Person' in entity_labels:
-                    companies_result = session.run("""
-                        MATCH (p:Person {id: $entity_id})-[r]->(c:Company)
-                        RETURN c, type(r) as relationship_type, r
-                    """, entity_id=entity_id).data()
-                    
-                    relationships['associated_companies'] = [
-                        {
-                            'company_id': record['c'].get('id'),
-                            'company_name': record['c'].get('name'),
-                            'relationship_type': record['relationship_type'],
-                            'relationship_details': dict(record['r'])
-                        }
-                        for record in companies_result
-                    ]
-                    
-                    # Find if person is a director
-                    director_result = session.run("""
-                        MATCH (p:Person {id: $entity_id})-[r:DIRECTOR_OF]->(c:Company)
-                        RETURN c, r
-                    """, entity_id=entity_id).data()
-                    
-                    relationships['director_of_companies'] = [
-                        {
-                            'company_id': record['c'].get('id'),
-                            'company_name': record['c'].get('name'),
-                            'position': record['r'].get('position', 'Director'),
-                            'status': record['r'].get('status', 'Unknown'),
-                            'appointment_date': record['r'].get('appointment_date', '')
-                        }
-                        for record in director_result
-                    ]
-                
-                # If it's a company, find associated persons
-                elif 'Company' in entity_labels:
-                    persons_result = session.run("""
-                        MATCH (c:Company {id: $entity_id})<-[r]-(p:Person)
-                        RETURN p, type(r) as relationship_type, r
-                    """, entity_id=entity_id).data()
-                    
-                    relationships['associated_persons'] = [
-                        {
-                            'person_id': record['p'].get('id'),
-                            'person_name': record['p'].get('name'),
-                            'relationship_type': record['relationship_type'],
-                            'relationship_details': dict(record['r'])
-                        }
-                        for record in persons_result
-                    ]
-                    
-                    # Find company directors
-                    directors_result = session.run("""
-                        MATCH (c:Company {id: $entity_id})<-[r:DIRECTOR_OF]-(d:Director)
-                        RETURN d, r
-                    """, entity_id=entity_id).data()
-                    
-                    relationships['directors'] = [
-                        {
-                            'director_id': record['d'].get('id'),
-                            'director_name': record['d'].get('name'),
-                            'external_director_id': record['d'].get('director_id', ''),
-                            'position': record['r'].get('position', 'Director'),
-                            'status': record['r'].get('status', 'Unknown'),
-                            'appointment_date': record['r'].get('appointment_date', '')
-                        }
-                        for record in directors_result
-                    ]
+                    relationships.append(relationship)
                 
                 return {
-                    'entity_found': True,
-                    'entity_type': entity_labels,
-                    'entity_name': entity_result['e'].get('name'),
-                    'relationships': relationships
+                    'created_relationships': relationships,
+                    'director_relationships': [r for r in relationships if r['type'] == 'DIRECTOR_OF'],
+                    'entity_relationships': [r for r in relationships if r['type'] != 'DIRECTOR_OF']
                 }
                 
         except Exception as e:
-            logger.error(f"Failed to find entity relationships: {str(e)}")
+            logging.error(f"Failed to find entity relationships: {str(e)}")
             return {
-                'entity_found': False,
-                'error': str(e),
-                'relationships': {}
+                'created_relationships': [],
+                'director_relationships': [],
+                'entity_relationships': []
             } 

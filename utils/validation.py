@@ -322,12 +322,22 @@ class InputValidator:
             raise ValueError(f"Invalid phone number format: {phone}")
     
     def _validate_email(self, email: str) -> str:
-        """Validate email format"""
-        try:
-            valid = validate_email(email)
-            return valid.email
-        except EmailNotValidError:
+        """Validate email format with more lenient rules"""
+        email = email.strip().lower()
+        
+        # Basic email format validation
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
             raise ValueError(f"Invalid email format: {email}")
+        
+        # Additional checks
+        if len(email) > 254:  # RFC 5321
+            raise ValueError(f"Email address too long: {email}")
+        
+        # Check for common typos
+        if '..' in email or '--' in email:
+            raise ValueError(f"Invalid email format: {email}")
+        
+        return email
     
     def _validate_date(self, date_str: str) -> str:
         """Validate date format (YYYY-MM-DD or similar)"""

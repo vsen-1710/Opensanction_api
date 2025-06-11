@@ -121,7 +121,7 @@ class CacheManager:
                 logger.debug(f"Cached data for key: {key} (TTL: {ttl_to_use}s)")
                 return True
             
-        except (redis.RedisError, json.JSONEncodeError) as e:
+        except (redis.RedisError, json.JSONDecodeError) as e:
             logger.warning(f"Error caching data for key {key}: {str(e)}")
         
         return False
