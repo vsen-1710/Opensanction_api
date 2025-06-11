@@ -111,7 +111,7 @@ class RiskService:
             
             ai_summary = self.ai_service.summarize_search_results(all_web_results, search_entities)
             
-            # Step 4: Graph analysis
+            # Step 4: Graph analysis and entity relationship handling
             logger.info("Analyzing entity connections...")
             entity_ids = []
             graph_analysis = {}
@@ -124,6 +124,9 @@ class RiskService:
                 entity_ids.append(entity_id)
                 graph_analysis[entity_id] = self.neo4j_service.analyze_entity_connections(entity_id)
             
+            # Handle entity relationships
+            relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
+            
             # Step 5: Calculate overall risk
             logger.info("Calculating final risk score...")
             risk_calculation = self.risk_calculator.calculate_comprehensive_risk(
@@ -132,7 +135,7 @@ class RiskService:
             
             # Build final response
             return self._build_final_response(validated_data, sanctions_results, web_intelligence_results, 
-                                            ai_summary, graph_analysis, risk_calculation, entity_ids, start_time)
+                                            ai_summary, graph_analysis, risk_calculation, entity_ids, start_time, relationship_analysis)
     
     def _assess_risk_sequential(self, validated_data: Dict[str, Any], search_entities: Dict[str, Dict[str, Any]], start_time: float) -> Dict[str, Any]:
         """Sequential processing for single entity or when parallel processing is disabled"""
@@ -158,7 +161,7 @@ class RiskService:
         
         ai_summary = self.ai_service.summarize_search_results(all_web_results, search_entities)
         
-        # Step 4: Graph analysis
+        # Step 4: Graph analysis and entity relationship handling
         logger.info("Analyzing entity connections...")
         entity_ids = []
         graph_analysis = {}
@@ -171,6 +174,9 @@ class RiskService:
             entity_ids.append(entity_id)
             graph_analysis[entity_id] = self.neo4j_service.analyze_entity_connections(entity_id)
         
+        # Handle entity relationships
+        relationship_analysis = self._handle_entity_relationships(validated_data, entity_ids)
+        
         # Step 5: Calculate overall risk
         logger.info("Calculating final risk score...")
         risk_calculation = self.risk_calculator.calculate_comprehensive_risk(
@@ -179,12 +185,101 @@ class RiskService:
         
         # Build final response
         return self._build_final_response(validated_data, sanctions_results, web_intelligence_results, 
-                                        ai_summary, graph_analysis, risk_calculation, entity_ids, start_time)
+                                        ai_summary, graph_analysis, risk_calculation, entity_ids, start_time, relationship_analysis)
     
+    def _handle_entity_relationships(self, validated_data: Dict[str, Any], entity_ids: List[str]) -> Dict[str, Any]:
+        """Handle entity relationships and director associations"""
+        relationship_analysis = {
+            'relationships_created': [],
+            'director_relationships': [],
+            'entity_associations': {}
+        }
+        
+        try:
+            # Handle person-company relationships
+            if validated_data.get('person') and validated_data.get('company') and len(entity_ids) >= 2:
+                person_id = entity_ids[0]  # Assuming person is first
+                company_id = entity_ids[1] if len(entity_ids) > 1 else None
+                
+                if company_id:
+                    # Create person-company association
+                    success = self.neo4j_service.create_person_company_relationship(person_id, company_id)
+                    if success:
+                        relationship_analysis['relationships_created'].append({
+                            'type': 'person_company_association',
+                            'person_id': person_id,
+                            'company_id': company_id
+                        })
+            
+            # Handle director relationships
+            company_data = validated_data.get('company', {})
+            if company_data:
+                company_id = None
+                # Find company entity ID
+                for i, entity_id in enumerate(entity_ids):
+                    if i == 1 or (i == 0 and not validated_data.get('person')):  # Company is second, or first if no person
+                        company_id = entity_id
+                        break
+                
+                if company_id:
+                    # Handle directors list
+                    directors = company_data.get('directors', [])
+                    for director in directors:
+                        director_id = director.get('director_id')
+                        if director_id:
+                            try:
+                                result = self.neo4j_service.create_director_relationship(
+                                    director_id, company_id, director
+                                )
+                                if result:
+                                    relationship_analysis['director_relationships'].append({
+                                        'director_id': director_id,
+                                        'company_id': company_id,
+                                        'director_name': director.get('name', ''),
+                                        'position': director.get('position', 'Director'),
+                                        'relationship_id': result
+                                    })
+                            except Exception as e:
+                                logger.error(f"Failed to create director relationship: {e}")
+                    
+                    # Handle single director_id (backward compatibility)
+                    director_id = company_data.get('director_id')
+                    if director_id and not directors:  # Only if no directors list was provided
+                        try:
+                            result = self.neo4j_service.create_director_relationship(
+                                director_id, company_id, {'director_id': director_id}
+                            )
+                            if result:
+                                relationship_analysis['director_relationships'].append({
+                                    'director_id': director_id,
+                                    'company_id': company_id,
+                                    'relationship_id': result
+                                })
+                        except Exception as e:
+                            logger.error(f"Failed to create director relationship: {e}")
+            
+            # Analyze existing relationships for all entities
+            for entity_id in entity_ids:
+                try:
+                    entity_relationships = self.neo4j_service.find_entity_relationships(entity_id)
+                    relationship_analysis['entity_associations'][entity_id] = entity_relationships
+                except Exception as e:
+                    logger.error(f"Failed to analyze relationships for {entity_id}: {e}")
+                    relationship_analysis['entity_associations'][entity_id] = {
+                        'entity_found': False,
+                        'error': str(e)
+                    }
+        
+        except Exception as e:
+            logger.error(f"Error handling entity relationships: {e}")
+            relationship_analysis['error'] = str(e)
+        
+        return relationship_analysis
+
     def _build_final_response(self, validated_data: Dict[str, Any], sanctions_results: Dict[str, Any], 
                             web_intelligence_results: Dict[str, Any], ai_summary: Dict[str, Any], 
                             graph_analysis: Dict[str, Any], risk_calculation: Dict[str, Any], 
-                            entity_ids: List[str], start_time: float) -> Dict[str, Any]:
+                            entity_ids: List[str], start_time: float, relationship_analysis: Dict[str, Any] = None) -> Dict[str, Any]:
         """Build the final comprehensive response"""
         input_type = validated_data.get('input_type', 'unknown')
         processing_time = int((time.time() - start_time) * 1000)
@@ -210,28 +305,80 @@ class RiskService:
             },
             'graph_analysis': {
                 'entity_ids': entity_ids,
-                'total_connections': sum(ga.get('connection_count', 0) for ga in graph_analysis.values()),
-                'risk_connections': sum(ga.get('risk_connections', 0) for ga in graph_analysis.values()),
-                'detailed_analysis': graph_analysis,
-                'simplified_mode': self.enable_fast_mode
+                'connections': graph_analysis,
+                'total_entities': len(entity_ids),
+                'risk_network_score': sum(conn.get('risk_connections', 0) for conn in graph_analysis.values())
             },
-            'risk_factors': risk_calculation.get('risk_factors', []),
-            'data_sources': {
-                'opensanctions_loaded': self.opensanctions_service.data_loaded,
-                'sanctions_entities': len(self.opensanctions_service.sanctions_data),
-                'web_sources': list(set().union(*[wi.get('sources_searched', []) for wi in web_intelligence_results.values()])),
-                'ai_provider': ai_summary.get('ai_provider', 'None')
-            },
-            'message': f'Comprehensive {input_type} risk assessment completed with real data'
+            'risk_factors': risk_calculation['risk_factors'],
+            'recommendations': self._generate_recommendations(risk_calculation, input_type),
+            'cache_key': self._generate_cache_key(validated_data)
         }
         
-        # Cache the result (TTL: 1 hour)
+        # Add relationship analysis if available
+        if relationship_analysis:
+            comprehensive_result['entity_relationships'] = relationship_analysis
+            
+            # Add director suggestions if company has director data
+            if validated_data.get('company') and relationship_analysis.get('director_relationships'):
+                comprehensive_result['director_analysis'] = self._generate_director_analysis(
+                    validated_data.get('company'), relationship_analysis['director_relationships']
+                )
+        
+        # Cache the result
         cache_key = self._generate_cache_key(validated_data)
-        self.cache_manager.set(cache_key, comprehensive_result, ttl=3600)
+        self.cache_manager.set(cache_key, comprehensive_result)
         
         entity_name = self._get_primary_entity_name(validated_data)
         logger.info(f"Risk assessment completed in {processing_time}ms for {input_type}: {entity_name}")
         return comprehensive_result
+
+    def _generate_director_analysis(self, company_data: Dict[str, Any], director_relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate analysis and suggestions based on director information"""
+        analysis = {
+            'total_directors': len(director_relationships),
+            'director_risk_analysis': [],
+            'suggestions': []
+        }
+        
+        for director_rel in director_relationships:
+            director_id = director_rel.get('director_id')
+            director_name = director_rel.get('director_name', 'Unknown')
+            
+            # Suggest performing individual risk assessment on directors
+            analysis['suggestions'].append({
+                'type': 'director_risk_assessment',
+                'director_id': director_id,
+                'director_name': director_name,
+                'suggestion': f"Perform individual risk assessment on director: {director_name} (ID: {director_id})",
+                'api_call_example': {
+                    'endpoint': '/api/check_risk',
+                    'method': 'POST',
+                    'body': {
+                        'person': {
+                            'name': director_name,
+                            'external_id': director_id
+                        }
+                    }
+                }
+            })
+            
+            analysis['director_risk_analysis'].append({
+                'director_id': director_id,
+                'director_name': director_name,
+                'position': director_rel.get('position', 'Director'),
+                'status': 'relationship_created',
+                'recommendation': 'Individual background check recommended'
+            })
+        
+        # Add general suggestions
+        if len(director_relationships) > 0:
+            analysis['suggestions'].append({
+                'type': 'company_governance_review',
+                'suggestion': f"Review company governance structure with {len(director_relationships)} director(s)",
+                'recommendation': "Consider comprehensive due diligence on all key personnel"
+            })
+        
+        return analysis
 
     def set_fast_mode(self, enabled: bool):
         """Enable or disable fast mode optimizations"""
@@ -395,4 +542,61 @@ class RiskService:
             key_components.append(f"c_reg:{company_data.get('registration_number', '').strip()}")
         
         key_string = ":".join(key_components)
-        return f"risk:{hashlib.md5(key_string.encode()).hexdigest()}" 
+        return f"risk:{hashlib.md5(key_string.encode()).hexdigest()}"
+
+    def _generate_recommendations(self, risk_calculation: Dict[str, Any], input_type: str) -> List[Dict[str, Any]]:
+        """Generate recommendations based on risk assessment results"""
+        recommendations = []
+        
+        # Add recommendations based on risk level
+        risk_level = risk_calculation.get('risk_level', 'LOW')
+        if risk_level == 'HIGH':
+            recommendations.append({
+                'type': 'high_risk',
+                'priority': 'high',
+                'message': 'Immediate action required due to high risk level',
+                'suggestions': [
+                    'Conduct enhanced due diligence',
+                    'Review all associated entities',
+                    'Consider additional verification steps'
+                ]
+            })
+        elif risk_level == 'MEDIUM':
+            recommendations.append({
+                'type': 'medium_risk',
+                'priority': 'medium',
+                'message': 'Standard due diligence recommended',
+                'suggestions': [
+                    'Review entity relationships',
+                    'Monitor for changes in risk factors',
+                    'Consider periodic re-assessment'
+                ]
+            })
+        
+        # Add recommendations based on input type
+        if input_type == 'person_and_company':
+            recommendations.append({
+                'type': 'relationship_analysis',
+                'priority': 'medium',
+                'message': 'Analyze person-company relationship',
+                'suggestions': [
+                    'Review historical relationship data',
+                    'Check for other associated entities',
+                    'Monitor relationship changes'
+                ]
+            })
+        
+        # Add recommendations for companies with directors
+        if input_type in ['company_only', 'person_and_company']:
+            recommendations.append({
+                'type': 'director_analysis',
+                'priority': 'medium',
+                'message': 'Review director information',
+                'suggestions': [
+                    'Verify director appointments',
+                    'Check director history',
+                    'Monitor director changes'
+                ]
+            })
+        
+        return recommendations 

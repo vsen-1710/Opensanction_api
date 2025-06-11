@@ -2,6 +2,7 @@ import logging
 import os
 from typing import Dict, Any, List
 import time
+from models.crime_models import CRIME_DOMAINS, CRIME_STAGES, CrimeDomain, CrimeStage
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,22 @@ class RiskCalculator:
             'medium': 0.5,   # Increased from 0.4
             'high': 0.7,
             'very_high': 0.9
+        }
+        
+        # Priority weights for crime domains
+        self.priority_weights = {
+            'P0': 1.0,  # Highest priority
+            'P1': 0.8,  # High priority
+            'P2': 0.6,  # Medium priority
+            'P3': 0.4   # Low priority
+        }
+        
+        # Stage weights for crime stages
+        self.stage_weights = {
+            'Stage 1': 0.4,  # Early stage
+            'Stage 2': 0.6,  # Investigation stage
+            'Stage 3': 0.8,  # Resolution stage
+            'Stage 4': 1.0   # Final stage
         }
     
     def calculate_risk(self, sanctions_result: Dict[str, Any], web_intelligence: Dict[str, Any], 
@@ -120,14 +137,18 @@ class RiskCalculator:
                 # Risk scoring based on sanctions type and confidence
                 base_risk = confidence
                 
-                # Enhance risk based on sanctions topic
+                # Enhance risk based on sanctions topic and crime domain
                 topics = match.get('topics', [])
-                if 'sanction' in topics:
-                    base_risk *= 1.2
-                if 'crime' in topics:
-                    base_risk *= 1.1
-                if 'poi' in topics:  # Person of Interest
-                    base_risk *= 1.05
+                for domain in CRIME_DOMAINS:
+                    if domain.name.lower() in ' '.join(topics).lower():
+                        base_risk *= (1.0 + self.priority_weights.get(domain.priority, 0.5))
+                        break
+                
+                # Enhance risk based on crime stage
+                for stage in CRIME_STAGES:
+                    if stage.name.lower() in ' '.join(topics).lower():
+                        base_risk *= (1.0 + self.stage_weights.get(stage.stage, 0.5))
+                        break
                 
                 max_risk = max(max_risk, min(base_risk, 1.0))
         
@@ -148,6 +169,13 @@ class RiskCalculator:
         for entity_key, result in web_intelligence_results.items():
             risk_indicators = result.get('risk_indicators', [])
             total_risk_indicators += len(risk_indicators)
+            
+            # Check risk indicators against crime domains
+            for indicator in risk_indicators:
+                for domain in CRIME_DOMAINS:
+                    if domain.name.lower() in indicator.lower():
+                        total_risk_indicators += self.priority_weights.get(domain.priority, 0.5)
+                        break
             
             sentiment = result.get('sentiment_score', 0)
             if sentiment != 0:
@@ -218,13 +246,41 @@ class RiskCalculator:
                 for match in matches[:3]:  # Top 3 matches
                     confidence = match.get('confidence', 0)
                     topics = match.get('topics', [])
-                    factors.append(f"Sanctions match: {confidence}% confidence, topics: {', '.join(topics)}")
+                    
+                    # Match topics with crime domains
+                    matched_domains = []
+                    for domain in CRIME_DOMAINS:
+                        if domain.name.lower() in ' '.join(topics).lower():
+                            matched_domains.append(f"{domain.name} ({domain.priority})")
+                    
+                    # Match topics with crime stages
+                    matched_stages = []
+                    for stage in CRIME_STAGES:
+                        if stage.name.lower() in ' '.join(topics).lower():
+                            matched_stages.append(f"{stage.name} ({stage.stage})")
+                    
+                    factors.append(f"Sanctions match: {confidence}% confidence")
+                    if matched_domains:
+                        factors.append(f"Matched crime domains: {', '.join(matched_domains)}")
+                    if matched_stages:
+                        factors.append(f"Matched crime stages: {', '.join(matched_stages)}")
         
         # Web intelligence factors
         for entity_key, result in web_intelligence_results.items():
             risk_indicators = result.get('risk_indicators', [])
             if risk_indicators:
-                factors.append(f"Web risk indicators for {entity_key}: {', '.join(risk_indicators[:3])}")
+                # Match indicators with crime domains
+                matched_domains = []
+                for indicator in risk_indicators:
+                    for domain in CRIME_DOMAINS:
+                        if domain.name.lower() in indicator.lower():
+                            matched_domains.append(f"{domain.name} ({domain.priority})")
+                            break
+                
+                if matched_domains:
+                    factors.append(f"Web risk indicators for {entity_key}: {', '.join(matched_domains)}")
+                else:
+                    factors.append(f"Web risk indicators for {entity_key}: {', '.join(risk_indicators[:3])}")
             
             sentiment = result.get('sentiment_score', 0)
             if sentiment < -0.3:

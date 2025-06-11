@@ -6,6 +6,7 @@ from services.risk_service import RiskService
 from utils.validation import InputValidator
 from utils.errors import RisknetError
 import config  # Import config module
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -156,6 +157,24 @@ def get_entity_graph(entity_id):
             'message': str(e)
         }), 500
 
+@app.route('/api/entity/<entity_id>/relationships', methods=['GET'])
+def get_entity_relationships(entity_id):
+    """Get all relationships for an entity (person belongs to company, company associated with person)"""
+    try:
+        relationships = risk_service.neo4j_service.find_entity_relationships(entity_id)
+        return jsonify({
+            'entity_id': entity_id,
+            'relationships': relationships,
+            'timestamp': int(time.time())
+        })
+    except Exception as e:
+        logger.error(f"Failed to get entity relationships: {str(e)}")
+        return jsonify({
+            'error': 'Entity relationships unavailable',
+            'message': str(e),
+            'entity_id': entity_id
+        }), 500
+
 @app.route('/api/stats', methods=['GET'])
 def get_statistics():
     """Get API statistics and status"""
@@ -195,7 +214,11 @@ def not_found(error):
             'GET /health',
             'POST /api/check_risk',
             'GET /api/entity/<id>/graph',
-            'GET /api/stats'
+            'GET /api/entity/<id>/relationships',
+            'GET /api/stats',
+            'POST /api/performance/fast-mode',
+            'GET /api/performance/status',
+            'POST /api/cache/clear'
         ]
     }), 404
 

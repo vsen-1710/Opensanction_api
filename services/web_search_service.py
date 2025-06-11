@@ -62,10 +62,27 @@ class WebSearchService:
     
     def _build_search_query(self, entity_name: str, entity_type: str) -> str:
         """Build search query based on entity type"""
+        # List of trusted news sources
+        trusted_sources = [
+            'theguardian.com',
+            'bbc.com',
+            'aljazeera.com',
+            'apnews.com',
+            'forbes.com',
+            'reuters.com',
+            'reddit.com'
+        ]
+        
+        # Build source filter
+        source_filter = ' OR '.join([f'site:{source}' for source in trusted_sources])
+        
         if entity_type == 'company':
-            return f'company: "{entity_name}" (sanctions OR criminal OR investigation)'
+            base_query = f'company: "{entity_name}" (sanctions OR criminal OR investigation)'
         else:
-            return f'person: "{entity_name}" (sanctions OR criminal OR investigation)'
+            base_query = f'person: "{entity_name}" (sanctions OR criminal OR investigation)'
+        
+        # Combine with source filter
+        return f'({base_query}) ({source_filter})'
     
     def _perform_search(self, query: str) -> List[Dict[str, Any]]:
         """Perform web search using available APIs"""
@@ -106,7 +123,8 @@ class WebSearchService:
                 'q': query,
                 'gl': 'us',
                 'hl': 'en',
-                'num': 10
+                'num': 20,  # Increased to get more results
+                'type': 'search'  # Ensure we get web search results
             }
             
             response = requests.post(
@@ -119,14 +137,29 @@ class WebSearchService:
                 results = response.json()
                 organic_results = results.get('organic', [])
                 
-                return [{
-                    'title': result.get('title', ''),
-                    'url': result.get('link', ''),
-                    'source': result.get('source', ''),
-                    'snippet': result.get('snippet', ''),
-                    'relevance_score': 0.8,  # Default score
-                    'search_engine': 'Google'
-                } for result in organic_results]
+                # Filter and process results
+                processed_results = []
+                for result in organic_results:
+                    source = result.get('source', '').lower()
+                    # Check if result is from a trusted source
+                    is_trusted = any(trusted in source for trusted in [
+                        'guardian', 'bbc', 'aljazeera', 'apnews', 
+                        'forbes', 'reuters', 'reddit'
+                    ])
+                    
+                    processed_results.append({
+                        'title': result.get('title', ''),
+                        'url': result.get('link', ''),
+                        'source': result.get('source', ''),
+                        'snippet': result.get('snippet', ''),
+                        'relevance_score': 0.9 if is_trusted else 0.7,  # Higher score for trusted sources
+                        'search_engine': 'Google',
+                        'is_trusted_source': is_trusted
+                    })
+                
+                # Sort results by relevance score
+                processed_results.sort(key=lambda x: x['relevance_score'], reverse=True)
+                return processed_results[:10]  # Return top 10 results
             
             return []
             

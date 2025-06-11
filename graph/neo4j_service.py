@@ -32,12 +32,16 @@ class Neo4jService:
                 # Create constraints
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Company) REQUIRE c.id IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.id IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (d:Director) REQUIRE d.id IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (w:WebSource) REQUIRE w.id IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (r:RiskIndicator) REQUIRE r.id IS UNIQUE")
                 
                 # Create indexes
                 session.run("CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (c:Company) ON (c.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (d:Director) ON (d.name)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (w:WebSource) ON (w.url)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (r:RiskIndicator) ON (r.type)")
                 
@@ -51,22 +55,79 @@ class Neo4jService:
         try:
             # Generate entity ID
             entity_id = self._generate_entity_id(entity_data)
+            entity_type = entity_data.get('type', 'unknown')
             
             with self.driver.session() as session:
-                # Create/update entity node
-                session.run("""
-                    MERGE (e:Entity {id: $entity_id})
-                    SET e.name = $name,
-                        e.type = $type,
-                        e.risk_level = $risk_level,
-                        e.updated_at = $timestamp
-                """, 
-                entity_id=entity_id,
-                name=entity_data.get('name', ''),
-                type=entity_data.get('type', 'unknown'),
-                risk_level=self._determine_risk_level(sanctions_data, web_data),
-                timestamp=int(time.time())
-                )
+                # Create/update specific entity type node
+                if entity_type == 'person':
+                    session.run("""
+                        MERGE (p:Person:Entity {id: $entity_id})
+                        SET p.name = $name,
+                            p.type = $type,
+                            p.phone = $phone,
+                            p.email = $email,
+                            p.address = $address,
+                            p.country = $country,
+                            p.date_of_birth = $date_of_birth,
+                            p.risk_level = $risk_level,
+                            p.updated_at = $timestamp
+                    """, 
+                    entity_id=entity_id,
+                    name=entity_data.get('name', ''),
+                    type=entity_type,
+                    phone=entity_data.get('phone', ''),
+                    email=entity_data.get('email', ''),
+                    address=entity_data.get('address', ''),
+                    country=entity_data.get('country', ''),
+                    date_of_birth=entity_data.get('date_of_birth', ''),
+                    risk_level=self._determine_risk_level(sanctions_data, web_data),
+                    timestamp=int(time.time())
+                    )
+                
+                elif entity_type == 'company':
+                    session.run("""
+                        MERGE (c:Company:Entity {id: $entity_id})
+                        SET c.name = $name,
+                            c.type = $type,
+                            c.phone = $phone,
+                            c.address = $address,
+                            c.country = $country,
+                            c.industry = $industry,
+                            c.registration_number = $registration_number,
+                            c.website = $website,
+                            c.incorporation_date = $incorporation_date,
+                            c.risk_level = $risk_level,
+                            c.updated_at = $timestamp
+                    """, 
+                    entity_id=entity_id,
+                    name=entity_data.get('name', ''),
+                    type=entity_type,
+                    phone=entity_data.get('phone', ''),
+                    address=entity_data.get('address', ''),
+                    country=entity_data.get('country', ''),
+                    industry=entity_data.get('industry', ''),
+                    registration_number=entity_data.get('registration_number', ''),
+                    website=entity_data.get('website', ''),
+                    incorporation_date=entity_data.get('incorporation_date', ''),
+                    risk_level=self._determine_risk_level(sanctions_data, web_data),
+                    timestamp=int(time.time())
+                    )
+                
+                else:
+                    # Generic entity
+                    session.run("""
+                        MERGE (e:Entity {id: $entity_id})
+                        SET e.name = $name,
+                            e.type = $type,
+                            e.risk_level = $risk_level,
+                            e.updated_at = $timestamp
+                    """, 
+                    entity_id=entity_id,
+                    name=entity_data.get('name', ''),
+                    type=entity_type,
+                    risk_level=self._determine_risk_level(sanctions_data, web_data),
+                    timestamp=int(time.time())
+                    )
                 
                 # Create web source relationships
                 for result in web_data.get('results', []):
@@ -303,4 +364,203 @@ class Neo4jService:
         """Close Neo4j connection"""
         if hasattr(self, 'driver'):
             self.driver.close()
-            logger.info("Neo4j connection closed") 
+            logger.info("Neo4j connection closed")
+
+    def create_director_relationship(self, director_id: str, company_id: str, 
+                                   director_info: Dict[str, Any] = None) -> str:
+        """Create director relationship between person and company"""
+        try:
+            with self.driver.session() as session:
+                # Create director node if director_info provided
+                if director_info:
+                    director_entity_id = f"director_{hashlib.md5(director_id.encode()).hexdigest()[:8]}"
+                    
+                    session.run("""
+                        MERGE (d:Director:Person:Entity {id: $director_id})
+                        SET d.name = $name,
+                            d.director_id = $external_director_id,
+                            d.position = $position,
+                            d.appointment_date = $appointment_date,
+                            d.status = $status,
+                            d.type = 'director',
+                            d.updated_at = $timestamp
+                    """,
+                        director_id=director_entity_id,
+                        external_director_id=director_id,
+                        name=director_info.get('name', ''),
+                        position=director_info.get('position', 'Director'),
+                        appointment_date=director_info.get('appointment_date', ''),
+                        status=director_info.get('status', 'Active'),
+                        timestamp=int(time.time())
+                    )
+                    
+                    # Create relationship between director and company
+                    session.run("""
+                        MATCH (d:Director {director_id: $director_id})
+                        MATCH (c:Company {id: $company_id})
+                        MERGE (d)-[r:DIRECTOR_OF]->(c)
+                        SET r.position = $position,
+                            r.appointment_date = $appointment_date,
+                            r.status = $status,
+                            r.created_at = $timestamp
+                    """,
+                        director_id=director_id,
+                        company_id=company_id,
+                        position=director_info.get('position', 'Director'),
+                        appointment_date=director_info.get('appointment_date', ''),
+                        status=director_info.get('status', 'Active'),
+                        timestamp=int(time.time())
+                    )
+                    
+                    return director_entity_id
+                else:
+                    # Just create relationship if both entities exist
+                    result = session.run("""
+                        MATCH (p:Person {id: $director_id})
+                        MATCH (c:Company {id: $company_id})
+                        MERGE (p)-[r:DIRECTOR_OF]->(c)
+                        SET r.created_at = $timestamp
+                        RETURN r
+                    """,
+                        director_id=director_id,
+                        company_id=company_id,
+                        timestamp=int(time.time())
+                    )
+                    
+                    if result.single():
+                        return f"relationship_created_{director_id}_{company_id}"
+                    else:
+                        logger.warning(f"Could not create director relationship - entities not found")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"Failed to create director relationship: {str(e)}")
+            raise
+
+    def create_person_company_relationship(self, person_id: str, company_id: str, 
+                                         relationship_type: str = "ASSOCIATED_WITH") -> bool:
+        """Create relationship between person and company"""
+        try:
+            with self.driver.session() as session:
+                result = session.run("""
+                    MATCH (p:Person {id: $person_id})
+                    MATCH (c:Company {id: $company_id})
+                    MERGE (p)-[r:ASSOCIATED_WITH]->(c)
+                    SET r.type = $relationship_type,
+                        r.created_at = $timestamp
+                    RETURN r
+                """,
+                    person_id=person_id,
+                    company_id=company_id,
+                    relationship_type=relationship_type,
+                    timestamp=int(time.time())
+                )
+                
+                return result.single() is not None
+                
+        except Exception as e:
+            logger.error(f"Failed to create person-company relationship: {str(e)}")
+            return False
+
+    def find_entity_relationships(self, entity_id: str) -> Dict[str, Any]:
+        """Find all relationships for an entity (person belongs to company, company associated with person)"""
+        try:
+            with self.driver.session() as session:
+                # Get entity details first
+                entity_result = session.run("""
+                    MATCH (e:Entity {id: $entity_id})
+                    RETURN e, labels(e) as labels
+                """, entity_id=entity_id).single()
+                
+                if not entity_result:
+                    return {
+                        'entity_found': False,
+                        'relationships': {}
+                    }
+                
+                entity_labels = entity_result['labels']
+                relationships = {}
+                
+                # If it's a person, find associated companies
+                if 'Person' in entity_labels:
+                    companies_result = session.run("""
+                        MATCH (p:Person {id: $entity_id})-[r]->(c:Company)
+                        RETURN c, type(r) as relationship_type, r
+                    """, entity_id=entity_id).data()
+                    
+                    relationships['associated_companies'] = [
+                        {
+                            'company_id': record['c'].get('id'),
+                            'company_name': record['c'].get('name'),
+                            'relationship_type': record['relationship_type'],
+                            'relationship_details': dict(record['r'])
+                        }
+                        for record in companies_result
+                    ]
+                    
+                    # Find if person is a director
+                    director_result = session.run("""
+                        MATCH (p:Person {id: $entity_id})-[r:DIRECTOR_OF]->(c:Company)
+                        RETURN c, r
+                    """, entity_id=entity_id).data()
+                    
+                    relationships['director_of_companies'] = [
+                        {
+                            'company_id': record['c'].get('id'),
+                            'company_name': record['c'].get('name'),
+                            'position': record['r'].get('position', 'Director'),
+                            'status': record['r'].get('status', 'Unknown'),
+                            'appointment_date': record['r'].get('appointment_date', '')
+                        }
+                        for record in director_result
+                    ]
+                
+                # If it's a company, find associated persons
+                elif 'Company' in entity_labels:
+                    persons_result = session.run("""
+                        MATCH (c:Company {id: $entity_id})<-[r]-(p:Person)
+                        RETURN p, type(r) as relationship_type, r
+                    """, entity_id=entity_id).data()
+                    
+                    relationships['associated_persons'] = [
+                        {
+                            'person_id': record['p'].get('id'),
+                            'person_name': record['p'].get('name'),
+                            'relationship_type': record['relationship_type'],
+                            'relationship_details': dict(record['r'])
+                        }
+                        for record in persons_result
+                    ]
+                    
+                    # Find company directors
+                    directors_result = session.run("""
+                        MATCH (c:Company {id: $entity_id})<-[r:DIRECTOR_OF]-(d:Director)
+                        RETURN d, r
+                    """, entity_id=entity_id).data()
+                    
+                    relationships['directors'] = [
+                        {
+                            'director_id': record['d'].get('id'),
+                            'director_name': record['d'].get('name'),
+                            'external_director_id': record['d'].get('director_id', ''),
+                            'position': record['r'].get('position', 'Director'),
+                            'status': record['r'].get('status', 'Unknown'),
+                            'appointment_date': record['r'].get('appointment_date', '')
+                        }
+                        for record in directors_result
+                    ]
+                
+                return {
+                    'entity_found': True,
+                    'entity_type': entity_labels,
+                    'entity_name': entity_result['e'].get('name'),
+                    'relationships': relationships
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to find entity relationships: {str(e)}")
+            return {
+                'entity_found': False,
+                'error': str(e),
+                'relationships': {}
+            } 

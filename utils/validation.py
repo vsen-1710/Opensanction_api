@@ -136,46 +136,54 @@ class InputValidator:
         return validated
     
     def _validate_company_data(self, company_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate company-specific data"""
+        """Validate and normalize company data"""
         validated = {}
         
-        # Company name validation
+        # Required: company name
         name = company_data.get('name', '').strip()
-        if name:
-            if len(name) < 2:
-                raise ValueError("Company name must be at least 2 characters")
-            if len(name) > 200:
-                raise ValueError("Company name must be less than 200 characters")
-            validated['name'] = name
+        if not name:
+            raise ValueError("Company name is required")
         
-        # Registration number validation
+        # Validate company name
+        if not self.company_pattern.match(name):
+            raise ValueError(f"Invalid company name format: {name}")
+        
+        validated['name'] = name
+        
+        # Optional: registration number
         reg_number = company_data.get('registration_number', '').strip()
         if reg_number:
+            # Basic registration number validation
+            if len(reg_number) < 3 or len(reg_number) > 50:
+                raise ValueError(f"Invalid registration number length: {reg_number}")
             validated['registration_number'] = reg_number
         
-        # Phone validation
+        # Optional: phone number
         phone = company_data.get('phone', '').strip()
         if phone:
-            validated['phone'] = self._validate_phone(phone)
+            try:
+                validated['phone'] = self._validate_phone(phone)
+            except ValueError as e:
+                logger.warning(f"Company phone validation warning: {str(e)}")
+                # For companies, be more lenient with phone numbers
+                if re.search(r'\d{7,}', phone):
+                    validated['phone'] = phone
         
-        # Email validation
-        email = company_data.get('email', '').strip()
-        if email:
-            validated['email'] = self._validate_email(email)
-        
-        # Address validation
+        # Optional: address
         address = company_data.get('address', '').strip()
         if address:
-            if len(address) > 500:
-                raise ValueError("Company address must be less than 500 characters")
+            if len(address) < 5 or len(address) > 500:
+                raise ValueError(f"Invalid address length: {address}")
+            if not self.address_pattern.match(address):
+                raise ValueError(f"Invalid address format: {address}")
             validated['address'] = address
         
-        # Country validation
+        # Optional: country
         country = company_data.get('country', '').strip()
         if country:
             validated['country'] = self._validate_country(country)
         
-        # Industry validation
+        # Optional: industry
         industry = company_data.get('industry', '').strip()
         if industry:
             validated['industry'] = industry
@@ -186,7 +194,78 @@ class InputValidator:
             if value:
                 validated[field] = value
         
+        # Handle directors information
+        directors = company_data.get('directors', [])
+        if directors:
+            validated['directors'] = self._validate_directors_data(directors)
+        
+        # Handle single director_id (backward compatibility)
+        director_id = company_data.get('director_id', '').strip()
+        if director_id:
+            validated['director_id'] = director_id
+            # If director_id provided but no directors list, create one
+            if 'directors' not in validated:
+                validated['directors'] = [{'director_id': director_id}]
+        
         return validated
+    
+    def _validate_directors_data(self, directors_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Validate directors information"""
+        validated_directors = []
+        
+        for director in directors_data:
+            if not isinstance(director, dict):
+                continue
+                
+            validated_director = {}
+            
+            # Director ID (could be external system ID)
+            director_id = director.get('director_id', '').strip()
+            if director_id:
+                validated_director['director_id'] = director_id
+            
+            # Director name
+            name = director.get('name', '').strip()
+            if name:
+                if self.name_pattern.match(name):
+                    validated_director['name'] = name
+                else:
+                    logger.warning(f"Invalid director name format: {name}")
+                    continue
+            
+            # Position/title
+            position = director.get('position', '').strip()
+            if position:
+                validated_director['position'] = position
+            else:
+                validated_director['position'] = 'Director'  # Default
+            
+            # Appointment date
+            appointment_date = director.get('appointment_date', '').strip()
+            if appointment_date:
+                try:
+                    validated_director['appointment_date'] = self._validate_date(appointment_date)
+                except ValueError:
+                    logger.warning(f"Invalid appointment date format: {appointment_date}")
+            
+            # Status
+            status = director.get('status', '').strip()
+            if status:
+                validated_director['status'] = status
+            else:
+                validated_director['status'] = 'Active'  # Default
+            
+            # Additional director fields
+            for field in ['nationality', 'date_of_birth', 'occupation']:
+                value = director.get(field, '').strip()
+                if value:
+                    validated_director[field] = value
+            
+            # Only add director if we have at least director_id or name
+            if validated_director.get('director_id') or validated_director.get('name'):
+                validated_directors.append(validated_director)
+        
+        return validated_directors
     
     def _validate_phone(self, phone: str) -> str:
         """Validate phone number format with more lenient validation"""
